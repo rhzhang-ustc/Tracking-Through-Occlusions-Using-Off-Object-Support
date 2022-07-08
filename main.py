@@ -1,5 +1,6 @@
 import flyingthingsdataset
 from flow_detection import flow_detect, linker, trajs_compare
+from io_preprocess import build_input_matrix
 from torch.utils.data import Dataset, DataLoader
 import cv2
 import numpy as np
@@ -16,7 +17,7 @@ import numpy as np
 # super parameters
 B = 1
 S = 8
-N = 128  # S, N, D = trajs.shape, D=2
+N = 256  # S, N, D = trajs.shape, D=2
 crop_size = (368, 496)
 
 force_double_inb = False
@@ -69,8 +70,8 @@ for sample in train_iterloader:
     long_trajs = trajs_compare(forward_link, backward_link, S=S)    # useful trajs with span=lifespan
 
     # generate input matrix
-    C, H, W = sample['rgbs'].size()[-3:]  # (3, 368, 496)
-    frames = sample['rgbs'].reshape(B, -1, H, W)  # (1, 8, 368, 496)
+    input_matrix = build_input_matrix(sample, long_trajs)
+
 
     break
 
