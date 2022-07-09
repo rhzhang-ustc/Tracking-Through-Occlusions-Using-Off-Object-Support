@@ -50,29 +50,3 @@ train_dataloader = DataLoader(
 train_iterloader = iter(train_dataloader)
 
 
-# while run: make sure batch size = 1
-for sample in train_iterloader:
-
-    # find some availabel trace
-    # implementation in style of 'particles'
-    forward_flow_list = flow_detect(sample) # shape(1792, 3), every row is [pt0, pt1, begin_frame]
-    backward_flow_list = flow_detect(sample, False)
-
-    forward_link = linker(forward_flow_list,
-                          S=S, N=N,
-                          lifespan=lifespan,
-                          consistency_threshold=consistency_threshold)
-    backward_link = linker(backward_flow_list,
-                           S=S, N=N,
-                           lifespan=lifespan,
-                           consistency_threshold=consistency_threshold)
-
-    long_trajs = trajs_compare(forward_link, backward_link, S=S)    # useful trajs with span=lifespan
-
-    # generate input matrix
-    input_matrix = build_input_matrix(sample, long_trajs)
-
-
-    break
-
-
