@@ -124,7 +124,6 @@ class FlyingThingsDataset(torch.utils.data.Dataset):
 
             folder_names = [folder.split('/')[-1] for folder in glob.glob(os.path.join(traj_root_path, "*"))]
             folder_names = sorted(folder_names)
-            # print('folder_names', folder_names)
 
             for ii, folder_name in enumerate(folder_names):
                 for lr in ['left', 'right']:
@@ -173,7 +172,7 @@ class FlyingThingsDataset(torch.utils.data.Dataset):
                     # print('found %d samples in %s so far...' % (len(self.rgb_paths), dataset_location))
                     sys.stdout.write('%.1f%%' % (100*(ii+1)/len(folder_names)))
                     sys.stdout.flush()
-        print('%.1f%%' % (100*(ii+1)/len(folder_names)))
+        # print('%.1f%%' % (100*(ii+1)/len(folder_names)))
         print('found %d samples in %s' % (len(self.rgb_paths), dataset_location))
 
 
