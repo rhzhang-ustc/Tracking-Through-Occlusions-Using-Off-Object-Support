@@ -62,13 +62,38 @@ num_band = 64
 
 def extract_frame_patches(frames, trajs, step=1):
     # frames: (B, S, C, H, W)
-    # traj: (B, S, 3)
-    # output: (B, S, feature_length)
+    # trajs: (B, S, N, 2)
+    # output: (B, S, N, feature_length) where feature are extracted according to (x, y)
 
     B, S, C, H, W = frames.size()
+    span = 2 * step + 1
+    feature_len = span * span * 3
+    patches = torch.zeros((B, S, N, feature_len))
 
+    # any quicker solutions?
+    for b in range(B):
+        for s in range(S):
+            for n in range(N):
 
-    pass
+                x = int(trajs[b, s, n, 0])
+                y = int(trajs[b, s, n, 1])
+
+                x = np.clip(x, 0, H-1)
+                y = np.clip(y, 0, W-1)
+
+                try:
+                    patches[b, s, n, :] = frames[b, s, :, x-step:x+step+1, y-step:y+step+1].reshape(1, -1)
+
+                except Exception:
+                    frames_new = frames[b, s, :, :, :]
+                    edge_row = torch.zeros((step, W)).cuda().float().repeat(C, 1, 1) # C, step, W
+                    edge_col = torch.zeros((H + 2 * step, step)).cuda().float().repeat(C, 1, 1)
+                    frames_new = torch.cat([edge_row, frames_new, edge_row], axis=-2)
+                    frames_new = torch.cat([edge_col, frames_new, edge_col], axis=-1)
+
+                    patches[b, s, n, :] = frames_new[:, x:x+2*step+1, y:y+2*step+1].reshape(1, -1)
+
+    return patches
 
 
 def run_model(model, queries, sample, criterion, optimizer):
@@ -81,19 +106,23 @@ def run_model(model, queries, sample, criterion, optimizer):
     B, S, C, H, W = rgbs.shape
     _, _, N, _ = trajs.shape
 
-    target = torch.mean(trajs, axis=1).cuda().float().squeeze(0)    # time average N, 2
+    target = torch.mean(trajs, axis=1).cuda().float().transpose(0, 1)    # time average, N, 1, 2
 
     t_pos = torch.arange(0, S).cuda().float()
     t_pos = t_pos.expand([B, N, -1]).unsqueeze(-1)
     t_pos = t_pos.transpose(1, 2)  # B, S, N, 1
 
-    pos = torch.concat([trajs, t_pos], axis=-1)  # (B, S, N, 3)
+    pos = torch.concat([trajs, t_pos], axis=-1)  # B, S, N, 3
 
     traj_encoding = generate_fourier_features(pos.reshape(-1, dim).cpu(), num_bands=64,
                                               max_resolution=crop_size_3d)
     traj_encoding = torch.from_numpy(traj_encoding.reshape(B*S, N, -1)).cuda().float()
     traj_encoding = traj_encoding.transpose(0, 1)  # N, S, 387
 
+    # frame patches
+    frame_patches = extract_frame_patches(rgbs, trajs)
+
+    # use perceiver io model
     pred = model(traj_encoding, queries=queries)
     total_loss += criterion(pred, target)
 
