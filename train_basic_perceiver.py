@@ -25,33 +25,79 @@ from tensorboardX import SummaryWriter
 import torch.nn.functional as F
 
 from perceiver_io import PerceiverIO
+from  position_encoding import generate_fourier_features
 
 device = 'cuda'
 patch_size = 8
 random.seed(125)
 np.random.seed(125)
 
+## choose hyps
+B = 1
+S = 8
+N = 64  # we need to load at least 4 i think
+lr = 1e-4
+grad_acc = 1
+
+crop_size = (368, 496)
+crop_size_3d = (368, 496, S)
+
+max_iters = 5000
+log_freq = 2
+save_freq = 200
+shuffle = True
+do_val = False
+cache = False
+cache_len = 101
+cache_freq = 99999999
+use_augs = False
+
+val_freq = 10
+
+queries_dim = 32
+dim = 3
+logis_dim = 2
+num_band = 64
+
+
+def extract_frame_patches(frames, trajs, step=1):
+    # frames: (B, S, C, H, W)
+    # traj: (B, S, 3)
+    # output: (B, S, feature_length)
+
+    B, S, C, H, W = frames.size()
+
+
+output = np.einsum()
+
+    pass
 
 def run_model(model, queries, sample, criterion, optimizer):
 
     total_loss = torch.tensor(0.0, requires_grad=True).to(device)
 
-    # rgbs = torch.from_numpy(sample['rgbs']).cuda().float()  # B, S, C, H, W
-    # masks = torch.from_numpy(sample['masks']).cuda().float()  # B, S, C, H, W
+    rgbs = torch.from_numpy(sample['rgbs']).cuda().float()  # B, S, C, H, W
     trajs = sample['trajs'].cuda().float()  # B, S, N, 2
-    # vis = sample['visibles'].cuda().float()  # B, S, N
-    # valids = sample['valids'].cuda().float()  # B, S, N
 
-    # B, S, C, H, W = rgbs.shape
-    B, S, N, _ = trajs.shape
-    # assert (C == 3)
+    B, S, C, H, W = rgbs.shape
+    _, _, N, _ = trajs.shape
 
     for n in range(N):
-        traj = trajs[:, :, n, :].reshape(B, S, 2)
-        avg = torch.mean(traj, axis=1).cuda().float()
-        target = avg.reshape(B, 1, 2)
 
-        pred = model(traj, queries=queries)
+        traj = trajs[:, :, n, :].reshape(B, -1, 2)   # (1, 8, 2)
+        target = torch.mean(traj, axis=1).cuda().float()    # time average
+        target = target[:, None, :]
+
+        t_pos = torch.arange(0, S).cuda().float()
+        pos = torch.concat([traj, t_pos.reshape(B, S, -1)], axis=-1)  # (B, 8, 3)
+
+        traj_encoding = generate_fourier_features(pos.reshape(-1, dim).cpu(), num_bands=64,
+                                                  max_resolution=crop_size_3d)
+        traj_encoding = torch.from_numpy(traj_encoding.reshape(B, S, -1)).cuda().float()
+
+        frame_feature = extract_frame_patches(rgbs, pos, step=1)
+
+        pred = model(traj_encoding, queries=queries)
         total_loss += criterion(pred, target)
 
     optimizer.zero_grad()
@@ -63,38 +109,17 @@ def run_model(model, queries, sample, criterion, optimizer):
 
 def train():
 
-    torch.cuda.empty_cache()
-
-    ## choose hyps
-    B = 1
-    S = 8
-    N = 64  # we need to load at least 4 i think
-    N2 = 32
-    lr = 1e-4
-    grad_acc = 1
-
-    crop_size = (368, 496)
-
-    max_iters = 1000
-    log_freq = 2
-    save_freq = 200
-    shuffle = True
-    do_val = False
-    cache = False
-    cache_len = 101
-    cache_freq = 99999999
-    use_augs = False
-
-    val_freq = 10
-
-    queries_dim = 32
+    # model save path
+    # model_path = 'checkpoints/01_8_64_32_1e-4_p1_avg_trajs_20:44:39.pth'  # where the ckpt is
+    # state = torch.load(model_path)
+    # model.load_state_dict(state['model_state'])
 
     # actual coeffs
     coeff_prob = 1.0
 
     ## autogen a name
     exp_name = 'avg_trajs'
-    model_name = "%02d_%d_%d_%d" % (B, S, N, N2)
+    model_name = "%02d_%d_%d" % (B, S, N)
     lrn = "%.1e" % lr  # e.g., 5.0e-04
     lrn = lrn[0] + lrn[3:5] + lrn[-1]  # e.g., 5e-4
     model_name += "_%s" % lrn
@@ -116,7 +141,7 @@ def train():
     model_name = model_name + '_' + model_date
     print('model_name', model_name)
 
-    ckpt_dir = 'checkpoints/%s' % model_name
+    ckpt_dir = 'checkpoints/%s' % model_name + '.pth'
     log_dir = 'logs'
     writer_t = SummaryWriter(log_dir + '/' + model_name + '/t', max_queue=10, flush_secs=60)
     if do_val:
@@ -170,8 +195,9 @@ def train():
         loss_pool_v = utils.misc.SimplePool(n_pool, version='np')
 
     total_loss = torch.tensor(0.0, requires_grad=True).to(device)
-    queries = torch.ones((1, queries_dim)).to(device)
-    model = PerceiverIO(depth=6, dim=2, queries_dim=queries_dim, logits_dim=2).to(device)
+    queries = torch.ones((B, queries_dim)).to(device)
+    model = PerceiverIO(depth=6, dim=dim*(2*num_band+1),
+                        queries_dim=queries_dim, logits_dim=logis_dim).to(device)
     criterion = nn.L1Loss()
     optimizer = optim.SGD(model.parameters(), lr=lr)
 
@@ -180,7 +206,6 @@ def train():
         model = model.train()
 
         read_start_time = time.time()
-
         global_step += 1
 
         sw_t = utils.improc.Summ_writer(
@@ -245,7 +270,7 @@ def train():
             sample['masks'] = sample['masks'].cpu().detach().numpy()
 
             with torch.no_grad():
-                total_loss, metrics = run_model(sample, N2, sw_v)
+                total_loss = run_model(model, queries, sample, criterion, optimizer)
             sw_v.summ_scalar('total_loss', total_loss)
             loss_pool_v.update([total_loss.detach().cpu().numpy()])
             sw_v.summ_scalar('pooled/total_loss', loss_pool_v.mean())
@@ -255,7 +280,7 @@ def train():
             model_name, global_step, max_iters, read_time, iter_time,
             total_loss.item()))
 
-        if global_step % save_freq:
+        if not global_step % save_freq:
             torch.save(model.state_dict(), ckpt_dir)
 
     writer_t.close()
