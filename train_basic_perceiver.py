@@ -68,9 +68,8 @@ def extract_frame_patches(frames, trajs, step=1):
     B, S, C, H, W = frames.size()
 
 
-output = np.einsum()
-
     pass
+
 
 def run_model(model, queries, sample, criterion, optimizer):
 
@@ -82,23 +81,21 @@ def run_model(model, queries, sample, criterion, optimizer):
     B, S, C, H, W = rgbs.shape
     _, _, N, _ = trajs.shape
 
-    for n in range(N):
+    target = torch.mean(trajs, axis=1).cuda().float().squeeze(0)    # time average N, 2
 
-        traj = trajs[:, :, n, :].reshape(B, -1, 2)   # (1, 8, 2)
-        target = torch.mean(traj, axis=1).cuda().float()    # time average
-        target = target[:, None, :]
+    t_pos = torch.arange(0, S).cuda().float()
+    t_pos = t_pos.expand([B, N, -1]).unsqueeze(-1)
+    t_pos = t_pos.transpose(1, 2)  # B, S, N, 1
 
-        t_pos = torch.arange(0, S).cuda().float()
-        pos = torch.concat([traj, t_pos.reshape(B, S, -1)], axis=-1)  # (B, 8, 3)
+    pos = torch.concat([trajs, t_pos], axis=-1)  # (B, S, N, 3)
 
-        traj_encoding = generate_fourier_features(pos.reshape(-1, dim).cpu(), num_bands=64,
-                                                  max_resolution=crop_size_3d)
-        traj_encoding = torch.from_numpy(traj_encoding.reshape(B, S, -1)).cuda().float()
+    traj_encoding = generate_fourier_features(pos.reshape(-1, dim).cpu(), num_bands=64,
+                                              max_resolution=crop_size_3d)
+    traj_encoding = torch.from_numpy(traj_encoding.reshape(B*S, N, -1)).cuda().float()
+    traj_encoding = traj_encoding.transpose(0, 1)  # N, S, 387
 
-        frame_feature = extract_frame_patches(rgbs, pos, step=1)
-
-        pred = model(traj_encoding, queries=queries)
-        total_loss += criterion(pred, target)
+    pred = model(traj_encoding, queries=queries)
+    total_loss += criterion(pred, target)
 
     optimizer.zero_grad()
     total_loss.backward()
@@ -109,6 +106,7 @@ def run_model(model, queries, sample, criterion, optimizer):
 
 def train():
 
+    assert B == 1
     # model save path
     # model_path = 'checkpoints/01_8_64_32_1e-4_p1_avg_trajs_20:44:39.pth'  # where the ckpt is
     # state = torch.load(model_path)
