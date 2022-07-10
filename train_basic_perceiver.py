@@ -256,7 +256,7 @@ def train():
             total_loss.item()))
 
         if global_step % save_freq:
-            torch.save(net.state_dict(), ckpt_dir)
+            torch.save(model.state_dict(), ckpt_dir)
 
     writer_t.close()
     if do_val:
