@@ -96,7 +96,7 @@ def extract_frame_patches(frames, trajs, step=1):
     return output
 
 
-def run_model(model, queries, sample, criterion, optimizer):
+def run_model(model, queries, sample, criterion):
 
     total_loss = torch.tensor(0.0, requires_grad=True).to(device)
 
@@ -107,7 +107,6 @@ def run_model(model, queries, sample, criterion, optimizer):
     _, _, N, _ = trajs.shape
 
     target = torch.mean(trajs, axis=1).cuda().float().transpose(0, 1)    # time average, N, 1, 2
-
     t_pos = torch.arange(0, S).cuda().float()
     t_pos = t_pos.expand([B, N, -1]).unsqueeze(-1)
     t_pos = t_pos.transpose(1, 2)  # B, S, N, 1
@@ -267,7 +266,7 @@ def train():
         read_time = time.time() - read_start_time
         iter_start_time = time.time()
 
-        total_loss = run_model(model, queries, sample, criterion, optimizer)
+        total_loss = run_model(model, queries, sample, criterion)
 
         optimizer.zero_grad()
         total_loss.backward()
