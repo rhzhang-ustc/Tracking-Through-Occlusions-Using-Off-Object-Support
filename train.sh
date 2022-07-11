@@ -23,7 +23,7 @@ echo "SLURMTMPDIR="$SLURMTMPDIR
 echo "working directory = "$SLURM_SUBMIT_DIR
 
 # process
-python3 train_perceiver.py > perceiver_logs.txt
+python3 train_perceiver.py --max_iters 50000 --cache_len 100 --use_cache True> logs.txt
 
 # can try the following to list out which GPU you have access to
 # srun /usr/local/cuda/samples/1_Utilities/deviceQuery/deviceQuery

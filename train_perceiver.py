@@ -1,6 +1,7 @@
 import time
 import numpy as np
 import matplotlib
+import argparse
 
 
 matplotlib.use('Agg')  # suppress plot showing
@@ -50,7 +51,7 @@ save_freq = 1000
 shuffle = True
 do_val = False
 cache = True
-cache_len = 10
+cache_len = 100
 cache_freq = 99999999
 use_augs = False
 
@@ -62,6 +63,7 @@ feature_dim = 27
 logis_dim = 2
 num_band = 64
 
+log_dir = 'logs'
 
 def extract_frame_patches(frames, trajs, step=1):
     # assert B = 1
@@ -144,6 +146,8 @@ def run_model(model, queries, sample, criterion):
 
 def train():
 
+
+
     assert B == 1
     # model save path
     # model_path = 'checkpoints/01_8_64_32_1e-4_p1_avg_trajs_20:44:39.pth'  # where the ckpt is
@@ -178,7 +182,6 @@ def train():
     print('model_name', model_name)
 
     ckpt_dir = 'checkpoints/%s' % model_name + '.pth'
-    log_dir = 'estimation_logs'
     writer_t = SummaryWriter(log_dir + '/' + model_name + '/t', max_queue=10, flush_secs=60)
     if do_val:
         writer_v = SummaryWriter(log_dir + '/' + model_name + '/v', max_queue=10, flush_secs=60)
@@ -331,4 +334,20 @@ def train():
 
 
 if __name__ == '__main__':
+    # init argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--max_iters', type=int, help='iteration numbers',
+                        default=10000)
+    parser.add_argument('--use_cache', type=bool, help='whether to use cache in training;',
+                        default=True)
+    parser.add_argument('--cache_len', type=int, help='cache len',
+                        default=None)
+    parser.add_argument('--logs_dir', type=str, default='logs')
+    args = parser.parse_args()
+
+    cache = args.use_cache
+    max_iters = args.max_iters
+    cache_len = args.cache_len
+    log_dir = args.logs_dir
+
     train()
