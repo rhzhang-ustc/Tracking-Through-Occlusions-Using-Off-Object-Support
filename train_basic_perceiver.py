@@ -8,6 +8,8 @@ import utils.py
 import utils.misc
 import utils.improc
 import utils.grouping
+import utils.samp
+import utils.basic
 import random
 
 from utils.basic import print_, print_stats
@@ -44,11 +46,11 @@ crop_size_3d = (368, 496, S)
 
 max_iters = 5000
 log_freq = 2
-save_freq = 200
+save_freq = 1000
 shuffle = True
 do_val = False
-cache = False
-cache_len = 101
+cache = True
+cache_len = 10
 cache_freq = 99999999
 use_augs = False
 
@@ -61,39 +63,37 @@ num_band = 64
 
 
 def extract_frame_patches(frames, trajs, step=1):
+    # assert B = 1
+    # steps: dilate conv style
     # frames: (B, S, C, H, W)
     # trajs: (B, S, N, 2)
     # output: (B, S, N, feature_length) where feature are extracted according to (x, y)
 
     B, S, C, H, W = frames.size()
-    span = 2 * step + 1
-    feature_len = span * span * 3
-    patches = torch.zeros((B, S, N, feature_len))
+    _, _, N, _ = trajs.size()
+    frames = frames.reshape(-1, C, H, W)  # B*S, C, H, W
+    trajs = trajs.reshape(-1, N, 2)  # B*S, N, 2
 
-    # any quicker solutions?
-    for b in range(B):
-        for s in range(S):
-            for n in range(N):
+    # generate grid matrix for flow, B*S, N*9, 2
+    x = torch.tensor(trajs[:, :, 0], dtype=torch.int).unsqueeze(-1)  # B, N, 1
+    y = torch.tensor(trajs[:, :, 1], dtype=torch.int).unsqueeze(-1)
 
-                x = int(trajs[b, s, n, 0])
-                y = int(trajs[b, s, n, 1])
+    x_range = torch.concat([x-step, x, x+step], axis=-1).unsqueeze(-1)  # B, N, 3, 1
+    y_range = torch.concat([y-step, y, y+step], axis=-1).unsqueeze(-2)  # B, N, 1, 3
 
-                x = np.clip(x, 0, H-1)
-                y = np.clip(y, 0, W-1)
+    grid_x = x_range.repeat(1, 1, 1, 3).flatten(start_dim=-2)  # meshgrid, B, N, 9
+    grid_y = y_range.repeat(1, 1, 3, 1).flatten(start_dim=-2)
 
-                try:
-                    patches[b, s, n, :] = frames[b, s, :, x-step:x+step+1, y-step:y+step+1].reshape(1, -1)
+    # bilinear sample, B*S, C, N*3*3
+    output = torch.zeros((B*S, C, N, 9))
+    for i in range(3):
+        for j in range(3):
+            output[:, :, :, 3*i+j] = utils.samp.bilinear_sample2d(frames, grid_x[:, :, i], grid_y[:, :, j])
 
-                except Exception:
-                    frames_new = frames[b, s, :, :, :]
-                    edge_row = torch.zeros((step, W)).cuda().float().repeat(C, 1, 1) # C, step, W
-                    edge_col = torch.zeros((H + 2 * step, step)).cuda().float().repeat(C, 1, 1)
-                    frames_new = torch.cat([edge_row, frames_new, edge_row], axis=-2)
-                    frames_new = torch.cat([edge_col, frames_new, edge_col], axis=-1)
+    # reshape, B, S, N, C*(2*step+1)*(2*step+1)
+    output = output.transpose(1, 2).reshape(B, S, N, -1)
 
-                    patches[b, s, n, :] = frames_new[:, x:x+2*step+1, y:y+2*step+1].reshape(1, -1)
-
-    return patches
+    return output
 
 
 def run_model(model, queries, sample, criterion, optimizer):
@@ -120,15 +120,11 @@ def run_model(model, queries, sample, criterion, optimizer):
     traj_encoding = traj_encoding.transpose(0, 1)  # N, S, 387
 
     # frame patches
-    frame_patches = extract_frame_patches(rgbs, trajs)
+    frame_features = extract_frame_patches(rgbs, trajs, step=1)
 
     # use perceiver io model
     pred = model(traj_encoding, queries=queries)
     total_loss += criterion(pred, target)
-
-    optimizer.zero_grad()
-    total_loss.backward()
-    optimizer.step()
 
     return total_loss
 
@@ -273,9 +269,14 @@ def train():
 
         total_loss = run_model(model, queries, sample, criterion, optimizer)
 
+        optimizer.zero_grad()
+        total_loss.backward()
+        optimizer.step()
+
         sw_t.summ_scalar('total_loss', total_loss)
         loss_pool_t.update([total_loss.detach().cpu().numpy()])
         sw_t.summ_scalar('pooled/total_loss', loss_pool_t.mean())
+
 
         if do_val and (global_step) % val_freq == 0:
             torch.cuda.empty_cache()
