@@ -47,7 +47,7 @@ crop_size_3d = (368, 496, S)
 
 max_iters = 10000
 log_freq = 2
-save_freq = 1000
+save_freq = 5000
 shuffle = True
 do_val = False
 cache = True
@@ -57,7 +57,7 @@ use_augs = False
 
 val_freq = 10
 
-queries_dim = 32
+queries_dim = 27 + 2
 dim = 3
 feature_dim = 27
 logis_dim = 2
@@ -66,89 +66,111 @@ num_band = 64
 log_dir = 'logs'
 
 def extract_frame_patches(frames, trajs, step=1):
-    # assert B = 1
     # steps: dilate conv style
-    # frames: (S, C, H, W)
-    # trajs: (S, N, 2)
-    # output: (S, N, feature_length) where feature are extracted according to (x, y)
+    # frames: (B, S, C, H, W)
+    # trajs: (B, S, N, 2)
+    # output: (B, S, N, feature_length) where feature are extracted according to (x, y)
 
-    S, C, H, W = frames.shape
-    _, N, _ = trajs.shape
+    B, S, C, H, W = frames.shape
+    _, _, N, _ = trajs.shape
 
-    # generate grid matrix for flow, B*S, N*9, 2
-    x = torch.tensor(trajs[:, :, 0], dtype=torch.int).unsqueeze(-1)  # B, N, 1
-    y = torch.tensor(trajs[:, :, 1], dtype=torch.int).unsqueeze(-1)
+    # generate grid matrix for flow, B, S, N*9, 2
+    x = torch.tensor(trajs[:, :, :, 0:1], dtype=torch.int)  # B, S, N, 1
+    y = torch.tensor(trajs[:, :, :, 1:], dtype=torch.int)
 
-    x_range = torch.concat([x-step, x, x+step], axis=-1).unsqueeze(-1)  # B, N, 3, 1
-    y_range = torch.concat([y-step, y, y+step], axis=-1).unsqueeze(-2)  # B, N, 1, 3
+    x_range = torch.concat([x-step, x, x+step], axis=-1).unsqueeze(-1)  # B, S, N, 3, 1
+    y_range = torch.concat([y-step, y, y+step], axis=-1).unsqueeze(-2)  # B, S, N, 1, 3
 
-    grid_x = x_range.repeat(1, 1, 1, 3).flatten(start_dim=-2)  # meshgrid, B, N, 9
-    grid_y = y_range.repeat(1, 1, 3, 1).flatten(start_dim=-2)
+    grid_x = x_range.repeat(1, 1, 1, 1, 3).flatten(start_dim=-2)  # meshgrid, B, S, N, 9
+    grid_y = y_range.repeat(1, 1, 1, 3, 1).flatten(start_dim=-2)
 
-    # bilinear sample, B*S, C, N*3*3
-    output = torch.zeros((B*S, C, N, 9))
-    for i in range(3):
-        for j in range(3):
-            output[:, :, :, 3*i+j] = utils.samp.bilinear_sample2d(frames, grid_x[:, :, i], grid_y[:, :, j])
+    # bilinear sample, B, S, N, C, 9
+    output = torch.zeros((B, S, N, C, 9))
+    for s in range(S):
+        for i in range(3):
+            for j in range(3):
+                temp = utils.samp.bilinear_sample2d(frames[:, s],
+                                                    grid_x[:, s, :, i], grid_y[:, s, :, j])  # B, C, N
 
-    # reshape, S, N, C*(2*step+1)*(2*step+1)
-    output = output.transpose(1, 2).reshape(S, N, -1)
+                output[:, s, :, :, 3*i+j] = temp.transpose(1, 2)
+
+    # reshape, B, S, N, C*(2*step+1)*(2*step+1)
+    output = output.flatten(start_dim=-2)
 
     return output
 
 
-def run_model(model, queries, sample, criterion):
+def run_model(model, sample, criterion, sw):
 
     total_loss = torch.tensor(0.0, requires_grad=True).to(device)
 
     rgbs = torch.from_numpy(sample['rgbs']).cuda().float()  # B, S, C, H, W
     trajs = sample['trajs'].cuda().float()  # B, S, N, 2
+    valids = sample['valids'].cuda().float()  # B, S, N
 
     B, S, C, H, W = rgbs.shape
     _, _, N, _ = trajs.shape
 
-    rgbs = rgbs.reshape(-1, C, H, W)  # S, C, H, W
-    trajs = trajs.reshape(-1, N, 2)     # S, N, 2
-
-    t_pos = torch.arange(0, S).cuda().float()
-    t_pos = t_pos.expand([N, -1]).unsqueeze(-1)
-    t_pos = t_pos.transpose(0, 1)  # S, N, 1
-    pos = torch.concat([trajs, t_pos], axis=-1)  # S, N, 3
-
     # generate target: one trajectory that needs to be estimate
     # then delete the point from trajs
+    target_traj = trajs[:, :, 0:1, :]   # B, S, 1, 2
 
-    target_traj = trajs[:, 0, :].unsqueeze(-2)  # S, 1, 2
+    start_target_traj = target_traj[:, 0:1, :, :]   # B, 1, 1, 2
 
-    target_pos = pos[:, 0, :].unsqueeze(-2)
-    pos = pos[:, 1:, :]  # S, N-1, 3
-    relative_pos = pos - target_pos
+    trajs = trajs[:, :, 1:, :]  # B, S, N-1, 2
+    relative_traj = trajs - start_target_traj.repeat([1, S, N-1, 1])    # B, S, N-1, 2
 
-    trajs = trajs[:, 1:, :]
-    traj_encoding = generate_fourier_features(relative_pos.reshape(-1, dim).cpu(), num_bands=64,
-                                              max_resolution=crop_size_3d)
-    traj_encoding = torch.from_numpy(traj_encoding.reshape(B*S, N-1, -1)).cuda().float()  # S, N-1, 387
+    # 3d position encoding
+    t_pos = torch.arange(0, S).cuda().float()
+    t_pos = t_pos.repeat([B, N-1, 1]).unsqueeze(-1)  # B, N-1, S, 1
+    t_pos = t_pos.transpose(1, 2)   # B, S, N-1, 1
+
+    relative_pos = torch.concat([relative_traj, t_pos], axis=-1)  # B, S, N-1, 3
+
+    # check other 3d position encoding implementation
+    relative_traj_encoding = generate_fourier_features(relative_pos.reshape(-1, dim).cpu(), num_bands=64,
+                                                       max_resolution=crop_size_3d)
+
+    # B, S, N-1, 387
+    relative_traj_encoding = torch.from_numpy(relative_traj_encoding.reshape(B, S, N-1, -1)).cuda().float()
 
     # frame patches
     frame_features = extract_frame_patches(rgbs, trajs, step=1)
-    frame_features = frame_features.cuda().float()
+    frame_features = frame_features.cuda().float()  # B, S, N-1, 27
 
-    # generate input matrix
-    input_matrix = torch.concat([traj_encoding, frame_features], axis=-1)   # S, N-1, 414
+    input_matrix = torch.concat([relative_traj_encoding, frame_features], axis=-1)   # B, S, N-1, 414
+    input_matrix = input_matrix.transpose(1, 2)
+    input_matrix = input_matrix.flatten(start_dim=-2)  # B, N-1, S*414
+
+    # generate queries
+    start_target_traj = start_target_traj.repeat(1, S, 1, 1)    # B, S, 1, 2
+    target_feature = extract_frame_patches(rgbs, start_target_traj).cuda().float()   # B, S, 1, 27
+
+    queries = torch.concat([start_target_traj,
+                            target_feature], dim=-1).squeeze(-2)    # B, S, 29
 
     # use perceiver io model
-    pred = model(input_matrix, queries=queries)
+    pred = model(input_matrix, queries=queries)  # B, S, 2; Batch time(number of tokens) channel
+    pred = pred.unsqueeze(-2)   # B, S, 1, 2
 
-    total_loss += criterion(pred, target_traj)
+    # target trajectories
+    relative_target_traj = target_traj - start_target_traj   # B, S, 1, 2
+
+    total_loss += criterion(pred, relative_target_traj)
+
+    if sw is not None and sw.save_this:
+        sw.summ_rgbs('inputs_0/rgbs', utils.improc.preprocess_color(rgbs[0:1]).unbind(1))
+        sw.summ_traj2ds_on_rgbs('inputs_0/trajs_on_rgbs', target_traj[0:1], utils.improc.preprocess_color(rgbs[0:1]),
+                                valids=valids[0:1], cmap='winter')
+
+        sw.summ_traj2ds_on_rgbs('inputs_0/pred_trajs_on_rgbs', (pred + start_target_traj)[0:1], utils.improc.preprocess_color(rgbs[0:1]),
+                                valids=valids[0:1], cmap='winter')
 
     return total_loss
 
 
 def train():
 
-
-
-    assert B == 1
     # model save path
     # model_path = 'checkpoints/01_8_64_32_1e-4_p1_avg_trajs_20:44:39.pth'  # where the ckpt is
     # state = torch.load(model_path)
@@ -234,8 +256,8 @@ def train():
         loss_pool_v = utils.misc.SimplePool(n_pool, version='np')
 
     total_loss = torch.tensor(0.0, requires_grad=True).to(device)
-    queries = torch.ones((B, queries_dim)).to(device)
-    model = PerceiverIO(depth=6, dim=dim*(2*num_band+1) + feature_dim,
+
+    model = PerceiverIO(depth=6, dim=S * (dim*(2*num_band+1) + feature_dim),
                         queries_dim=queries_dim, logits_dim=logis_dim).to(device)
 
     criterion = nn.L1Loss()
@@ -251,7 +273,7 @@ def train():
         sw_t = utils.improc.Summ_writer(
             writer=writer_t,
             global_step=global_step,
-            log_freq=log_freq,
+            log_freq=500,
             fps=5,
             scalar_freq=int(log_freq / 2),
             just_gif=True)
@@ -284,7 +306,7 @@ def train():
         read_time = time.time() - read_start_time
         iter_start_time = time.time()
 
-        total_loss = run_model(model, queries, sample, criterion)
+        total_loss = run_model(model, sample, criterion, sw_t)
 
         optimizer.zero_grad()
         total_loss.backward()
@@ -341,7 +363,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_cache', type=bool, help='whether to use cache in training;',
                         default=True)
     parser.add_argument('--cache_len', type=int, help='cache len',
-                        default=None)
+                        default=1)
     parser.add_argument('--logs_dir', type=str, default='logs')
     args = parser.parse_args()
 
