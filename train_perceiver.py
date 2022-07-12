@@ -60,7 +60,7 @@ val_freq = 10
 queries_dim = 27 + 2
 dim = 3
 feature_dim = 27
-logis_dim = 2
+logis_dim = 2 * S
 num_band = 64
 
 log_dir = 'logs'
@@ -71,8 +71,8 @@ def extract_frame_patches(frames, trajs, step=1):
     # trajs: (B, S, N, 2)
     # output: (B, S, N, feature_length) where feature are extracted according to (x, y)
 
-    B, S, C, H, W = frames.shape
-    _, _, N, _ = trajs.shape
+    _, _, C, H, W = frames.shape
+    B, S, N, _ = trajs.shape
 
     # generate grid matrix for flow, B, S, N*9, 2
     x = torch.tensor(trajs[:, :, :, 0:1], dtype=torch.int)  # B, S, N, 1
@@ -143,15 +143,13 @@ def run_model(model, sample, criterion, sw):
     input_matrix = input_matrix.flatten(start_dim=-2)  # B, N-1, S*414
 
     # generate queries
-    start_target_traj = start_target_traj.repeat(1, S, 1, 1)    # B, S, 1, 2
-    target_feature = extract_frame_patches(rgbs, start_target_traj).cuda().float()   # B, S, 1, 27
-
+    target_feature = extract_frame_patches(rgbs, start_target_traj).cuda().float()   # B, 1, 1, 27
     queries = torch.concat([start_target_traj,
-                            target_feature], dim=-1).squeeze(-2)    # B, S, 29
+                            target_feature], dim=-1).squeeze(-2)    # B, 1, 29
 
     # use perceiver io model
-    pred = model(input_matrix, queries=queries)  # B, S, 2; Batch time(number of tokens) channel
-    pred = pred.unsqueeze(-2)   # B, S, 1, 2
+    pred = model(input_matrix, queries=queries)  # B, 1, 2 *S ; Batch time(number of tokens) channel
+    pred = pred.reshape(B, S, 1, -1)
 
     # target trajectories
     relative_target_traj = target_traj - start_target_traj   # B, S, 1, 2
@@ -259,6 +257,7 @@ def train():
 
     model = PerceiverIO(depth=6, dim=S * (dim*(2*num_band+1) + feature_dim),
                         queries_dim=queries_dim, logits_dim=logis_dim).to(device)
+    model = torch.nn.DataParallel(model)
 
     criterion = nn.L1Loss()
     optimizer = optim.SGD(model.parameters(), lr=lr)
