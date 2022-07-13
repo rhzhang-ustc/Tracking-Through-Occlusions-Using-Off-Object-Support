@@ -28,6 +28,7 @@ from tensorboardX import SummaryWriter
 import torch.nn.functional as F
 
 from perceiver_io import PerceiverIO
+from perceiver_pytorch import Perceiver
 from  position_encoding import generate_fourier_features
 
 device = 'cuda'
@@ -64,6 +65,7 @@ logis_dim = 2 * S
 num_band = 64
 
 log_dir = 'logs'
+
 
 def extract_frame_patches(frames, trajs, step=1):
     # steps: dilate conv style
@@ -144,11 +146,10 @@ def run_model(model, sample, criterion, sw):
 
     # generate queries
     target_feature = extract_frame_patches(rgbs, start_target_traj).cuda().float()   # B, 1, 1, 27
-    queries = torch.concat([start_target_traj,
-                            target_feature], dim=-1).squeeze(-2)    # B, 1, 29
+    queries = torch.concat([start_target_traj,  target_feature], dim=-1).squeeze(-2)    # B, 1, 29
 
     # use perceiver io model
-    pred = model(input_matrix, queries=queries)  # B, 1, 2 *S ; Batch time(number of tokens) channel
+    pred = model(input_matrix)  # B, 1, 2 *S ; Batch time(number of tokens) channel
     pred = pred.reshape(B, S, 1, -1)
 
     # target trajectories
@@ -209,17 +210,11 @@ def train():
     def worker_init_fn(worker_id):
         np.random.seed(np.random.get_state()[1][0] + worker_id)
 
-    force_double_inb = False
-    force_all_inb = False
-
     train_dataset = flyingthingsdataset.FlyingThingsDataset(
         dset='TRAIN', subset='A',
         use_augs=use_augs,
         N=N, S=S,
-        crop_size=crop_size,
-        version='ac',
-        force_double_inb=force_double_inb,
-        force_all_inb=force_all_inb)
+        crop_size=crop_size)
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=B,
@@ -237,8 +232,7 @@ def train():
         print('not using augs in val')
         val_dataset = flyingthingsdataset.FlyingThingsDataset(dset='TEST', subset='all',
                                                               use_augs=False, N=N, S=S, crop_size=crop_size,
-                                                              version='ak', force_double_inb=force_double_inb,
-                                                              force_all_inb=force_all_inb)
+                                                              version='ak')
         val_dataloader = DataLoader(
             val_dataset,
             batch_size=1,
@@ -255,8 +249,17 @@ def train():
 
     total_loss = torch.tensor(0.0, requires_grad=True).to(device)
 
-    model = PerceiverIO(depth=6, dim=S * (dim*(2*num_band+1) + feature_dim),
-                        queries_dim=queries_dim, logits_dim=logis_dim).to(device)
+    # model = PerceiverIO(depth=6, dim=S * (dim*(2*num_band+1) + feature_dim),
+                        # queries_dim=queries_dim, logits_dim=logis_dim).to(device)
+
+    model = Perceiver(depth=6, fourier_encode_data=False, num_classes=S * 2,
+                      num_freq_bands=64,
+                      max_freq=N,
+                      input_axis=1,
+                      input_channels=S * (dim*(2*num_band+1) + feature_dim),
+                      final_classifier_head=True)
+
+    model = model.cuda()
     model = torch.nn.DataParallel(model)
 
     criterion = nn.L1Loss()
@@ -336,7 +339,7 @@ def train():
             sample['masks'] = sample['masks'].cpu().detach().numpy()
 
             with torch.no_grad():
-                total_loss = run_model(model, queries, sample, criterion, optimizer)
+                total_loss = run_model(model, sample, criterion, optimizer)
             sw_v.summ_scalar('total_loss', total_loss)
             loss_pool_v.update([total_loss.detach().cpu().numpy()])
             sw_v.summ_scalar('pooled/total_loss', loss_pool_v.mean())
