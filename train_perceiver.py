@@ -40,7 +40,7 @@ np.random.seed(125)
 B = 1
 S = 8
 N = 64 +1 # we need to load at least 4 i think
-lr = 1e-4
+lr = 3e-4
 grad_acc = 1
 
 crop_size = (368, 496)
@@ -49,7 +49,7 @@ crop_size_3d = (368, 496, S)
 max_iters = 10000
 log_freq = 2
 save_freq = 5000
-shuffle = True
+shuffle = False
 do_val = False
 cache = True
 cache_len = 100
@@ -61,7 +61,7 @@ val_freq = 10
 queries_dim = 27 + 2
 dim = 3
 feature_dim = 27
-logis_dim = 2 * S
+# logis_dim = 2 * S
 num_band = 64
 
 log_dir = 'logs'
@@ -129,24 +129,21 @@ def run_model(model, sample, criterion, sw):
 
     relative_pos = torch.concat([relative_traj, t_pos], axis=-1)  # B, S, N-1, 3
 
-    # check other 3d position encoding implementation
-    relative_traj_encoding = generate_fourier_features(relative_pos.reshape(-1, dim).cpu(), num_bands=64,
-                                                       max_resolution=crop_size_3d)
-
-    # B, S, N-1, 387
-    relative_traj_encoding = torch.from_numpy(relative_traj_encoding.reshape(B, S, N-1, -1)).cuda().float()
+    # 3d position encoding
+    relative_traj_encoding = utils.misc.get_3d_embedding(relative_pos.reshape(-1, N-1, 3), num_band)
+    relative_traj_encoding = relative_traj_encoding.reshape(B, S, N-1, -1)  # B, S, N-1, 195
 
     # frame patches
     frame_features = extract_frame_patches(rgbs, trajs, step=1)
     frame_features = frame_features.cuda().float()  # B, S, N-1, 27
 
-    input_matrix = torch.concat([relative_traj_encoding, frame_features], axis=-1)   # B, S, N-1, 414
+    input_matrix = torch.concat([relative_traj_encoding, frame_features], axis=-1)   # B, S, N-1, 222
     input_matrix = input_matrix.transpose(1, 2)
-    input_matrix = input_matrix.flatten(start_dim=-2)  # B, N-1, S*414
+    input_matrix = input_matrix.flatten(start_dim=-2)  # B, N-1, S*222
 
     # generate queries
-    target_feature = extract_frame_patches(rgbs, start_target_traj).cuda().float()   # B, 1, 1, 27
-    queries = torch.concat([start_target_traj,  target_feature], dim=-1).squeeze(-2)    # B, 1, 29
+    # target_feature = extract_frame_patches(rgbs, start_target_traj).cuda().float()   # B, 1, 1, 27
+    # queries = torch.concat([start_target_traj,  target_feature], dim=-1).squeeze(-2)    # B, 1, 29
 
     # use perceiver io model
     pred = model(input_matrix)  # B, 1, 2 *S ; Batch time(number of tokens) channel
@@ -158,12 +155,21 @@ def run_model(model, sample, criterion, sw):
     total_loss += criterion(pred, relative_target_traj)
 
     if sw is not None and sw.save_this:
-        sw.summ_rgbs('inputs_0/rgbs', utils.improc.preprocess_color(rgbs[0:1]).unbind(1))
-        sw.summ_traj2ds_on_rgbs('inputs_0/trajs_on_rgbs', target_traj[0:1], utils.improc.preprocess_color(rgbs[0:1]),
-                                valids=valids[0:1], cmap='winter')
+        # sw.summ_rgbs('inputs_0/rgbs', utils.improc.preprocess_color(rgbs[0:1]).unbind(1))
+        # sw.summ_traj2ds_on_rgbs('inputs_0/trajs_on_rgbs', target_traj[0:1], utils.improc.preprocess_color(rgbs[0:1]),
+                                # valids=valids[0:1], cmap='winter')
 
-        sw.summ_traj2ds_on_rgbs('inputs_0/pred_trajs_on_rgbs', (pred + start_target_traj)[0:1], utils.improc.preprocess_color(rgbs[0:1]),
-                                valids=valids[0:1], cmap='winter')
+        # sw.summ_traj2ds_on_rgbs('inputs_0/pred_trajs_on_rgbs', (pred + start_target_traj)[0:1], utils.improc.preprocess_color(rgbs[0:1]),
+                                # valids=valids[0:1], cmap='winter')
+
+        gt_rgb = utils.improc.preprocess_color(
+            sw.summ_traj2ds_on_rgb('', target_traj[0:1], torch.mean(utils.improc.preprocess_color(rgbs[0:1]), dim=1),
+                                   valids=valids[0:1], cmap='winter', only_return=True))
+        gt_black = utils.improc.preprocess_color(
+            sw.summ_traj2ds_on_rgb('', target_traj[0:1], torch.ones_like(rgbs[0:1, 0]) * -0.5, valids=valids[0:1],
+                                   cmap='winter', only_return=True))
+        sw.summ_traj2ds_on_rgb('outputs/single_trajs_on_gt_rgb', (pred + start_target_traj)[0:1], gt_rgb[0:1], cmap='spring')
+        sw.summ_traj2ds_on_rgb('outputs/single_trajs_on_gt_black', (pred + start_target_traj)[0:1], gt_black[0:1], cmap='spring')
 
     return total_loss
 
@@ -256,7 +262,7 @@ def train():
                       num_freq_bands=64,
                       max_freq=N,
                       input_axis=1,
-                      input_channels=S * (dim*(2*num_band+1) + feature_dim),
+                      input_channels=S * ((3*num_band+3) + feature_dim),
                       final_classifier_head=True)
 
     model = model.cuda()
