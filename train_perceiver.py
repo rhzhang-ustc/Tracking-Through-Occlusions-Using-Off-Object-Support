@@ -2,7 +2,7 @@ import time
 import numpy as np
 import matplotlib
 import argparse
-
+import cv2
 
 matplotlib.use('Agg')  # suppress plot showing
 import utils.py
@@ -40,11 +40,10 @@ np.random.seed(125)
 B = 1
 S = 8
 N = 64 +1 # we need to load at least 4 i think
-lr = 1e-4
+lr = 1e-4 * 10
 grad_acc = 1
 
 crop_size = (368, 496)
-crop_size_3d = (368, 496, S)
 
 max_iters = 10000
 log_freq = 2
@@ -61,10 +60,35 @@ val_freq = 10
 queries_dim = 27 + 2
 dim = 3
 feature_dim = 27
-# logis_dim = 2 * S
 num_band = 64
+first_pred_w = 0.5
+top_k_supporters = 10
 
-log_dir = 'logs'
+log_dir = 'supporter_logs'
+
+
+def write_result(frame_lst, output_path, colored):
+
+    frame_shape = frame_lst[0].shape
+    video_size = (frame_shape[1], frame_shape[0])
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video = cv2.VideoWriter(output_path, fourcc, 30, video_size, colored)
+
+    for frame in frame_lst:
+        video.write(frame)
+
+    video.release()
+
+
+def draw_arrows(frame, pts, dx, dy):
+    pt_num = len(pts)
+    for i in range(pt_num):
+        pt = pts[i]
+        cv2.line(frame, pt, (int(pt[0] + dx[i]), int(pt[1] + dy[i])), (0, 255, 0), 2)
+        cv2.circle(frame, pt, 2, color=(255, 0, 0))
+        cv2.circle(frame, (int(pt[0] + dx[i]), int(pt[1] + dy[i])), 2, color=(0, 0, 255))
+
+    return frame
 
 
 def extract_frame_patches(frames, trajs, step=1):
@@ -77,8 +101,8 @@ def extract_frame_patches(frames, trajs, step=1):
     B, S, N, _ = trajs.shape
 
     # generate grid matrix for flow, B, S, N*9, 2
-    x = torch.tensor(trajs[:, :, :, 0:1], dtype=torch.int)  # B, S, N, 1
-    y = torch.tensor(trajs[:, :, :, 1:], dtype=torch.int)
+    x = trajs[:, :, :, 0:1].clone().detach().int()  # B, S, N, 1
+    y = trajs[:, :, :, 1:].clone().detach().int()
 
     x_range = torch.concat([x-step, x, x+step], axis=-1).unsqueeze(-1)  # B, S, N, 3, 1
     y_range = torch.concat([y-step, y, y+step], axis=-1).unsqueeze(-2)  # B, S, N, 1, 3
@@ -116,11 +140,10 @@ def run_model(model, sample, criterion, sw):
     # generate target: one trajectory that needs to be estimate
     # then delete the point from trajs
     target_traj = trajs[:, :, 0:1, :]   # B, S, 1, 2
-
     start_target_traj = target_traj[:, 0:1, :, :]   # B, 1, 1, 2
 
     trajs = trajs[:, :, 1:, :]  # B, S, N-1, 2
-    relative_traj = trajs - start_target_traj.repeat([1, S, N-1, 1])    # B, S, N-1, 2
+    relative_traj = trajs - start_target_traj   # B, S, N-1, 2
 
     # 3d position encoding
     t_pos = torch.arange(0, S).cuda().float()
@@ -129,38 +152,62 @@ def run_model(model, sample, criterion, sw):
 
     relative_pos = torch.concat([relative_traj, t_pos], axis=-1)  # B, S, N-1, 3
 
+    # chop relative pos into short trajs:  B, S*(N-1), 3, 2
+    # where 3, 2 means x0, y0, t0, x1, y1, t1 (start & end point)
+    first_loc = relative_pos[:, :-1, :, :]  # B, S-1, N-1, 3
+    second_loc = relative_pos[:, 1:, :, :]
+
     # 3d position encoding
-    relative_traj_encoding = utils.misc.get_3d_embedding(relative_pos.reshape(-1, N-1, 3), num_band)
-    relative_traj_encoding = relative_traj_encoding.reshape(B, S, N-1, -1)  # B, S, N-1, 195
+    first_loc_encoding = utils.misc.get_3d_embedding(first_loc.reshape(-1, N-1, 3), num_band)
+    second_loc_encoding = utils.misc.get_3d_embedding(second_loc.reshape(-1, N-1, 3), num_band)
+    short_trajs_encoding = torch.concat([first_loc_encoding, second_loc_encoding], axis=-1)  # B*(S-1), N-1, 390
+    short_trajs_encoding = short_trajs_encoding.reshape(B, S-1, N-1, -1)
 
     # frame patches
     frame_features = extract_frame_patches(rgbs, trajs, step=1)
     frame_features = frame_features.cuda().float()  # B, S, N-1, 27
+    first_frame_features = frame_features[:, :-1, :, :]
+    second_frame_feature = frame_features[:, 1:, :, :]
 
-    input_matrix = torch.concat([relative_traj_encoding, frame_features], axis=-1)   # B, S, N-1, 222
+    short_trajs_features = torch.concat([first_frame_features, second_frame_feature], axis=-1)
+
+    # generate input matrix through concat
+    input_matrix = torch.concat([short_trajs_encoding, short_trajs_features], axis=-1)   # B, S-1, N-1, 444
     input_matrix = input_matrix.transpose(1, 2)
-    input_matrix = input_matrix.flatten(start_dim=-2)  # B, N-1, S*222
+    input_matrix = input_matrix.flatten(start_dim=-2)  # B, N-1, (S-1)*444
 
-    # generate queries
-    # target_feature = extract_frame_patches(rgbs, start_target_traj).cuda().float()   # B, 1, 1, 27
-    # queries = torch.concat([start_target_traj,  target_feature], dim=-1).squeeze(-2)    # B, 1, 29
+    # use perceiver model instead of perceiver io
+    # such a 'classification' model really works?
+    pred = model(input_matrix)  # B, 8 * (N-1) * (S-1) ; Batch time(number of tokens) channel
+    pred = pred.reshape(B, S-1, N-1, -1)
 
-    # use perceiver io model
-    pred = model(input_matrix)  # B, 1, 2 *S ; Batch time(number of tokens) channel
-    pred = pred.reshape(B, S, 1, -1)
+    # generate voting features
+    dx0 = pred[:, :, :, 0:1]
+    dx1 = pred[:, :, :, 1:2]
+    dy0 = pred[:, :, :, 2:3]
+    dy1 = pred[:, :, :, 3:4]
+    wx0 = torch.softmax(pred[:, :, :, 4:5], dim=-2)     # B, S-1, N-1, 1
+    wx1 = torch.softmax(pred[:, :, :, 5:6], dim=-2)
+    wy0 = torch.softmax(pred[:, :, :, 6:7], dim=-2)
+    wy1 = torch.softmax(pred[:, :, :, 7:], dim=-2)
 
-    # target trajectories
-    relative_target_traj = target_traj - start_target_traj   # B, S, 1, 2
+    first_pred_traj_x = torch.sum((first_loc[:, :, :, 0:1] + dx0) * wx0, axis=-2)   # B, S-1, 1
+    first_pred_traj_y = torch.sum((first_loc[:, :, :, 1:2] + dy0) * wy0, axis=-2)
+    second_pred_traj_x = torch.sum((second_loc[:, :, :, 0:1] + dx1) * wx1, axis=-2)
+    second_pred_traj_y = torch.sum((second_loc[:, :, :, 1:2] + dy1) * wy1, axis=-2)
 
-    total_loss += criterion(pred, relative_target_traj)
+    first_pred_traj = torch.concat([first_pred_traj_x, first_pred_traj_y], axis=-1)
+    second_pred_traj = torch.concat([second_pred_traj_x, second_pred_traj_y], axis=-1)
+
+    pred_traj = torch.concat([first_pred_traj[:, 0:1, :],
+                              first_pred_w * first_pred_traj[:, 1:, :] + (1-first_pred_w) * second_pred_traj[:, :-1, :],
+                              second_pred_traj[:, -1:, :]], axis=-2)     # B, S, 2
+    pred_traj = pred_traj.unsqueeze(-2)
+
+    # prediction vs target
+    total_loss = criterion(target_traj, pred_traj)
 
     if sw is not None and sw.save_this:
-        # sw.summ_rgbs('inputs_0/rgbs', utils.improc.preprocess_color(rgbs[0:1]).unbind(1))
-        # sw.summ_traj2ds_on_rgbs('inputs_0/trajs_on_rgbs', target_traj[0:1], utils.improc.preprocess_color(rgbs[0:1]),
-                                # valids=valids[0:1], cmap='winter')
-
-        # sw.summ_traj2ds_on_rgbs('inputs_0/pred_trajs_on_rgbs', (pred + start_target_traj)[0:1], utils.improc.preprocess_color(rgbs[0:1]),
-                                # valids=valids[0:1], cmap='winter')
 
         gt_rgb = utils.improc.preprocess_color(
             sw.summ_traj2ds_on_rgb('', target_traj[0:1], torch.mean(utils.improc.preprocess_color(rgbs[0:1]), dim=1),
@@ -168,8 +215,28 @@ def run_model(model, sample, criterion, sw):
         gt_black = utils.improc.preprocess_color(
             sw.summ_traj2ds_on_rgb('', target_traj[0:1], torch.ones_like(rgbs[0:1, 0]) * -0.5, valids=valids[0:1],
                                    cmap='winter', only_return=True))
-        sw.summ_traj2ds_on_rgb('outputs/single_trajs_on_gt_rgb', (pred + start_target_traj)[0:1], gt_rgb[0:1], cmap='spring')
-        sw.summ_traj2ds_on_rgb('outputs/single_trajs_on_gt_black', (pred + start_target_traj)[0:1], gt_black[0:1], cmap='spring')
+        sw.summ_traj2ds_on_rgb('outputs/single_trajs_on_gt_rgb', pred_traj[0:1], gt_rgb[0:1], cmap='spring')
+        sw.summ_traj2ds_on_rgb('outputs/single_trajs_on_gt_black', pred_traj[0:1], gt_black[0:1], cmap='spring')
+
+        #  test
+        _, first_supporter_idx = torch.topk((wx0 ** 2 + wy0 ** 2), top_k_supporters, dim=-2)  # B, S-1, 10, 1
+        frame_lst = []
+        for i in range(S - 1):
+            frame = rgbs[0, i]
+            frame = frame.transpose(0, 2)
+            frame = np.array(frame.transpose(0, 1).int().cpu())  # H, W, C
+            frame = frame.copy()
+
+            supporter_idx = first_supporter_idx[:, i, :, 0]  # B, 10
+            pts = trajs[0, i]
+
+            pts = np.array(pts[supporter_idx].int().cpu())  # B, 10, 2
+            dx = np.array(dx0[0, i][supporter_idx].int().cpu())  # B, 10, 1
+            dy = np.array(dy0[0, i][supporter_idx].int().cpu())
+            frame_drawn = draw_arrows(frame, pts[0], dx[0], dy[0])
+            frame_lst.append(np.uint8(255 * frame_drawn))
+
+        write_result(frame_lst, "test.mp4", True)
 
     return total_loss
 
@@ -258,11 +325,11 @@ def train():
     # model = PerceiverIO(depth=6, dim=S * (dim*(2*num_band+1) + feature_dim),
                         # queries_dim=queries_dim, logits_dim=logis_dim).to(device)
 
-    model = Perceiver(depth=6, fourier_encode_data=False, num_classes=S * 2,
+    model = Perceiver(depth=6, fourier_encode_data=False, num_classes=8 * (N-1) * (S-1),
                       num_freq_bands=64,
                       max_freq=N,
                       input_axis=1,
-                      input_channels=S * ((3*num_band+3) + feature_dim),
+                      input_channels=(S-1) * 2 * ((3*num_band+3) + feature_dim),
                       final_classifier_head=True)
 
     model = model.cuda()
@@ -281,7 +348,7 @@ def train():
         sw_t = utils.improc.Summ_writer(
             writer=writer_t,
             global_step=global_step,
-            log_freq=500,
+            log_freq=50,
             fps=5,
             scalar_freq=int(log_freq / 2),
             just_gif=True)
@@ -372,7 +439,7 @@ if __name__ == '__main__':
                         default=True)
     parser.add_argument('--cache_len', type=int, help='cache len',
                         default=1)
-    parser.add_argument('--logs_dir', type=str, default='logs')
+    parser.add_argument('--logs_dir', type=str, default='supporter_logs')
     args = parser.parse_args()
 
     cache = args.use_cache
