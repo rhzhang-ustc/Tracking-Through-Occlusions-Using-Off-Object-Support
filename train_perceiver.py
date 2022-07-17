@@ -29,7 +29,6 @@ import torch.nn.functional as F
 
 from perceiver_io import PerceiverIO
 from perceiver_pytorch import Perceiver
-from  position_encoding import generate_fourier_features
 
 device = 'cuda'
 patch_size = 8
@@ -85,8 +84,9 @@ def draw_arrows(frame, pts, dx, dy):
     for i in range(pt_num):
         pt = pts[i]
         cv2.line(frame, pt, (int(pt[0] + dx[i]), int(pt[1] + dy[i])), (0, 255, 0), 2)
-        cv2.circle(frame, pt, 2, color=(255, 0, 0))
-        cv2.circle(frame, (int(pt[0] + dx[i]), int(pt[1] + dy[i])), 2, color=(0, 0, 255))
+        cv2.circle(frame, pt, 4, color=(255, 0, 0))
+        cv2.rectangle(frame, (int(pt[0] + dx[i]), int(pt[1] + dy[i])), (int(pt[0] + dx[i]+3), int(pt[1] + dy[i])+3),
+                      color=(0, 0, 255))
 
     return frame
 
@@ -218,14 +218,15 @@ def run_model(model, sample, criterion, sw):
         sw.summ_traj2ds_on_rgb('outputs/single_trajs_on_gt_rgb', pred_traj[0:1], gt_rgb[0:1], cmap='spring')
         sw.summ_traj2ds_on_rgb('outputs/single_trajs_on_gt_black', pred_traj[0:1], gt_black[0:1], cmap='spring')
 
-        #  test
+        sw.summ_rgbs('inputs_0/rgbs', utils.improc.preprocess_color(rgbs[0:1]).unbind(1))
+
+        # generate arrows
         _, first_supporter_idx = torch.topk((wx0 ** 2 + wy0 ** 2), top_k_supporters, dim=-2)  # B, S-1, 10, 1
         frame_lst = []
         for i in range(S - 1):
             frame = rgbs[0, i]
-            frame = frame.transpose(0, 2)
-            frame = np.array(frame.transpose(0, 1).int().cpu())  # H, W, C
-            frame = frame.copy()
+            frame = np.array(frame.permute(1, 2, 0).contiguous().int().cpu())  # H, W, C, rgb
+            frame = np.uint8(255 * frame[:, :, ::-1])   # bgr
 
             supporter_idx = first_supporter_idx[:, i, :, 0]  # B, 10
             pts = trajs[0, i]
@@ -234,7 +235,7 @@ def run_model(model, sample, criterion, sw):
             dx = np.array(dx0[0, i][supporter_idx].int().cpu())  # B, 10, 1
             dy = np.array(dy0[0, i][supporter_idx].int().cpu())
             frame_drawn = draw_arrows(frame, pts[0], dx[0], dy[0])
-            frame_lst.append(np.uint8(255 * frame_drawn))
+            frame_lst.append(frame_drawn)
 
         write_result(frame_lst, "test.mp4", True)
 
@@ -325,10 +326,12 @@ def train():
     # model = PerceiverIO(depth=6, dim=S * (dim*(2*num_band+1) + feature_dim),
                         # queries_dim=queries_dim, logits_dim=logis_dim).to(device)
 
-    model = Perceiver(depth=6, fourier_encode_data=False, num_classes=8 * (N-1) * (S-1),
+    model = Perceiver(depth=16, fourier_encode_data=False, num_classes=8 * (N-1) * (S-1),
                       num_freq_bands=64,
                       max_freq=N,
                       input_axis=1,
+                      num_latents=512,
+                      latent_dim=1024,
                       input_channels=(S-1) * 2 * ((3*num_band+3) + feature_dim),
                       final_classifier_head=True)
 
@@ -348,7 +351,7 @@ def train():
         sw_t = utils.improc.Summ_writer(
             writer=writer_t,
             global_step=global_step,
-            log_freq=50,
+            log_freq=500,
             fps=5,
             scalar_freq=int(log_freq / 2),
             just_gif=True)
