@@ -39,13 +39,13 @@ np.random.seed(125)
 B = 1
 S = 8
 N = 64 +1 # we need to load at least 4 i think
-lr = 1e-4 * 10
+lr = 1e-4
 grad_acc = 1
 
 crop_size = (368, 496)
 
 max_iters = 10000
-log_freq = 2
+log_freq = 500
 save_freq = 5000
 shuffle = False
 do_val = False
@@ -60,8 +60,7 @@ queries_dim = 27 + 2
 dim = 3
 feature_dim = 27
 num_band = 64
-first_pred_w = 0.5
-top_k_supporters = 10
+k = 10      # visualize top k supporters
 
 log_dir = 'supporter_logs'
 
@@ -79,14 +78,20 @@ def write_result(frame_lst, output_path, colored):
     video.release()
 
 
-def draw_arrows(frame, pts, dx, dy):
-    pt_num = len(pts)
-    for i in range(pt_num):
-        pt = pts[i]
-        cv2.line(frame, pt, (int(pt[0] + dx[i]), int(pt[1] + dy[i])), (0, 255, 0), 2)
-        cv2.circle(frame, pt, 4, color=(255, 0, 0))
-        cv2.rectangle(frame, (int(pt[0] + dx[i]), int(pt[1] + dy[i])), (int(pt[0] + dx[i]+3), int(pt[1] + dy[i])+3),
-                      color=(0, 0, 255))
+def draw_arrows(frame, supporters, votes):
+
+    k, _ = supporters.shape
+
+    for idx in range(k):
+        pt = supporters[idx]
+        dxy = votes[idx]
+
+        start_x = int(pt[0])
+        start_y = int(pt[1])
+        end_x = int(pt[0] + dxy[0])
+        end_y = int(pt[1] + dxy[1])
+
+        cv2.arrowedLine(frame, (start_x, start_y), (end_x, end_y), (255, 0, 0), 2, 9, 0, 0.3)
 
     return frame
 
@@ -154,57 +159,91 @@ def run_model(model, sample, criterion, sw):
 
     # chop relative pos into short trajs:  B, S*(N-1), 3, 2
     # where 3, 2 means x0, y0, t0, x1, y1, t1 (start & end point)
-    first_loc = relative_pos[:, :-1, :, :]  # B, S-1, N-1, 3
-    second_loc = relative_pos[:, 1:, :, :]
+    start_loc = relative_pos[:, :-1, :, :]  # B, S-1, N-1, 3
+    end_loc = relative_pos[:, 1:, :, :]
+
+    # parameter M indicate the number of trajs
+    M = (S-1) * (N-1)
+    short_traj = torch.concat([start_loc, end_loc], axis=-1).flatten(start_dim=-3, end_dim=-2)  # B, M, 6
+    # flatten along the S-1 dimension, so short_traj[0, :N-1] are trajs that begin at 0 and end at 1
 
     # 3d position encoding
-    first_loc_encoding = utils.misc.get_3d_embedding(first_loc.reshape(-1, N-1, 3), num_band)
-    second_loc_encoding = utils.misc.get_3d_embedding(second_loc.reshape(-1, N-1, 3), num_band)
-    short_trajs_encoding = torch.concat([first_loc_encoding, second_loc_encoding], axis=-1)  # B*(S-1), N-1, 390
+    start_loc_encoding = utils.misc.get_3d_embedding(start_loc.reshape(-1, N-1, 3), num_band)
+    end_loc_encoding = utils.misc.get_3d_embedding(end_loc.reshape(-1, N-1, 3), num_band)
+    short_trajs_encoding = torch.concat([start_loc_encoding, end_loc_encoding], axis=-1)  # B*(S-1), N-1, 390
     short_trajs_encoding = short_trajs_encoding.reshape(B, S-1, N-1, -1)
 
     # frame patches
-    frame_features = extract_frame_patches(rgbs, trajs, step=1)
-    frame_features = frame_features.cuda().float()  # B, S, N-1, 27
-    first_frame_features = frame_features[:, :-1, :, :]
-    second_frame_feature = frame_features[:, 1:, :, :]
+    frame_features = extract_frame_patches(rgbs, trajs, step=1).cuda().float()  # B, S, N-1, 27
+    start_frame_features = frame_features[:, :-1, :, :]
+    end_frame_feature = frame_features[:, 1:, :, :]
 
-    short_trajs_features = torch.concat([first_frame_features, second_frame_feature], axis=-1)
+    short_trajs_features = torch.concat([start_frame_features, end_frame_feature], axis=-1)
 
     # generate input matrix through concat
     input_matrix = torch.concat([short_trajs_encoding, short_trajs_features], axis=-1)   # B, S-1, N-1, 444
-    input_matrix = input_matrix.transpose(1, 2)
-    input_matrix = input_matrix.flatten(start_dim=-2)  # B, N-1, (S-1)*444
+    input_matrix = input_matrix.flatten(start_dim=-3, end_dim=-2)  # B, M, 444
 
     # use perceiver model instead of perceiver io
-    # such a 'classification' model really works?
-    pred = model(input_matrix)  # B, 8 * (N-1) * (S-1) ; Batch time(number of tokens) channel
-    pred = pred.reshape(B, S-1, N-1, -1)
+    pred = model(input_matrix)  # B, 6 * M ; Batch time(number of tokens) channel
+    pred = pred.reshape(B, M, -1)
 
     # generate voting features
-    dx0 = pred[:, :, :, 0:1]
-    dx1 = pred[:, :, :, 1:2]
-    dy0 = pred[:, :, :, 2:3]
-    dy1 = pred[:, :, :, 3:4]
-    wx0 = torch.softmax(pred[:, :, :, 4:5], dim=-2)     # B, S-1, N-1, 1
-    wx1 = torch.softmax(pred[:, :, :, 5:6], dim=-2)
-    wy0 = torch.softmax(pred[:, :, :, 6:7], dim=-2)
-    wy1 = torch.softmax(pred[:, :, :, 7:], dim=-2)
+    dx0 = pred[:, :, 0:1]
+    dy0 = pred[:, :, 1:2]
+    dx1 = pred[:, :, 2:3]
+    dy1 = pred[:, :, 3:4]
+    dt = torch.zeros(dx0.shape).cuda().float()
 
-    first_pred_traj_x = torch.sum((first_loc[:, :, :, 0:1] + dx0) * wx0, axis=-2)   # B, S-1, 1
-    first_pred_traj_y = torch.sum((first_loc[:, :, :, 1:2] + dy0) * wy0, axis=-2)
-    second_pred_traj_x = torch.sum((second_loc[:, :, :, 0:1] + dx1) * wx1, axis=-2)
-    second_pred_traj_y = torch.sum((second_loc[:, :, :, 1:2] + dy1) * wy1, axis=-2)
+    w0 = pred[:, :, 4:5]  # B, M  weight for vote that begins at start point
+    w1 = pred[:, :, 5:6]
 
-    first_pred_traj = torch.concat([first_pred_traj_x, first_pred_traj_y], axis=-1)
-    second_pred_traj = torch.concat([second_pred_traj_x, second_pred_traj_y], axis=-1)
+    # make sure that w are normalized inside the same timestep
+    # generate prediction
 
-    pred_traj = torch.concat([first_pred_traj[:, 0:1, :],
-                              first_pred_w * first_pred_traj[:, 1:, :] + (1-first_pred_w) * second_pred_traj[:, :-1, :],
-                              second_pred_traj[:, -1:, :]], axis=-2)     # B, S, 2
-    pred_traj = pred_traj.unsqueeze(-2)
+    vote_matrix = torch.concat([dx0, dy0, dt, dx1, dy1, dt], dim=-1)
+    pred_traj = torch.zeros(B, S, 2).cuda().float()
 
-    # prediction vs target
+    frame_lst = []  # for visualization
+
+    for i in range(S):
+        step = N-1  # trajs num that start at time step i
+
+        if i == 0:
+            supporters = short_traj[:, :step, :3]
+            votes = vote_matrix[:, :step, :3]
+            w = w0[:, :step]
+
+        elif i == S-1:
+            supporters = short_traj[:, (S-2)*step:, 3:6]
+            votes = vote_matrix[:, (S-2)*step:, 3:6]
+            w = w1[:, (S-2)*step:]
+
+        else:
+            supporters = torch.concat([short_traj[:, i*step:(i+1)*step, :3],      # start at frame i
+                                       short_traj[:, (i-1)*step:i*step, 3:6]], axis=-2)       # end at frame i
+            votes = torch.concat([vote_matrix[:, i*step:(i+1)*step, :3],
+                                  vote_matrix[:, (i-1)*step:i*step, 3:6]], axis=-2)
+            w = torch.concat([w0[:, i*step:(i+1)*step], w1[:, (i-1)*step:i*step]], axis=-2)
+
+        vote_pts = supporters + votes
+        norm_w = torch.softmax(w, dim=-2)
+        pred_traj[:, i] = torch.sum(norm_w * vote_pts, dim=-2)[:, 0:2]
+
+        if sw is not None and sw.save_this:
+            _, top_k_index = torch.topk(norm_w, k, dim=-2)  # B, 10, 1
+
+            k_supporter = supporters.index_select(1, top_k_index[0, :, 0])  # B, 10, 3
+            k_votes = votes.index_select(1, top_k_index[0, :, 0])
+
+            frame = rgbs[0, i].transpose(0, 2).transpose(0, 1).cpu()
+            frame = np.array(frame)[:, :, ::-1]
+            frame = np.ascontiguousarray(frame, dtype=np.int32)    # H, W, C
+
+            frame_drawn = draw_arrows(frame, k_supporter[0].cpu().detach(), k_votes[0].cpu().detach())
+            frame_lst.append(np.array(frame_drawn, dtype=np.uint8))
+
+    pred_traj = pred_traj.unsqueeze(-2)     # B, S, 1, 2
     total_loss = criterion(target_traj, pred_traj)
 
     if sw is not None and sw.save_this:
@@ -219,25 +258,8 @@ def run_model(model, sample, criterion, sw):
         sw.summ_traj2ds_on_rgb('outputs/single_trajs_on_gt_black', pred_traj[0:1], gt_black[0:1], cmap='spring')
 
         sw.summ_rgbs('inputs_0/rgbs', utils.improc.preprocess_color(rgbs[0:1]).unbind(1))
-
-        # generate arrows
-        _, first_supporter_idx = torch.topk((wx0 ** 2 + wy0 ** 2), top_k_supporters, dim=-2)  # B, S-1, 10, 1
-        frame_lst = []
-        for i in range(S - 1):
-            frame = rgbs[0, i]
-            frame = np.array(frame.permute(1, 2, 0).contiguous().int().cpu())  # H, W, C, rgb
-            frame = np.uint8(255 * frame[:, :, ::-1])   # bgr
-
-            supporter_idx = first_supporter_idx[:, i, :, 0]  # B, 10
-            pts = trajs[0, i]
-
-            pts = np.array(pts[supporter_idx].int().cpu())  # B, 10, 2
-            dx = np.array(dx0[0, i][supporter_idx].int().cpu())  # B, 10, 1
-            dy = np.array(dy0[0, i][supporter_idx].int().cpu())
-            frame_drawn = draw_arrows(frame, pts[0], dx[0], dy[0])
-            frame_lst.append(frame_drawn)
-
-        write_result(frame_lst, "test.mp4", True)
+        if len(frame_lst):
+            write_result(frame_lst, "test.mp4", True)
 
     return total_loss
 
@@ -326,13 +348,13 @@ def train():
     # model = PerceiverIO(depth=6, dim=S * (dim*(2*num_band+1) + feature_dim),
                         # queries_dim=queries_dim, logits_dim=logis_dim).to(device)
 
-    model = Perceiver(depth=16, fourier_encode_data=False, num_classes=8 * (N-1) * (S-1),
+    model = Perceiver(depth=6, fourier_encode_data=False, num_classes=6 * (N-1) * (S-1),
                       num_freq_bands=64,
                       max_freq=N,
                       input_axis=1,
                       num_latents=512,
-                      latent_dim=1024,
-                      input_channels=(S-1) * 2 * ((3*num_band+3) + feature_dim),
+                      latent_dim=512,
+                      input_channels=2 * ((3*num_band+3) + feature_dim),
                       final_classifier_head=True)
 
     model = model.cuda()
@@ -351,9 +373,9 @@ def train():
         sw_t = utils.improc.Summ_writer(
             writer=writer_t,
             global_step=global_step,
-            log_freq=500,
+            log_freq=log_freq,
             fps=5,
-            scalar_freq=int(log_freq / 2),
+            scalar_freq=2,
             just_gif=True)
 
         if cache:
@@ -404,7 +426,7 @@ def train():
                 global_step=global_step,
                 log_freq=log_freq,
                 fps=5,
-                scalar_freq=int(log_freq / 2),
+                scalar_freq=2,
                 just_gif=True)
             try:
                 sample = next(val_iterloader)
