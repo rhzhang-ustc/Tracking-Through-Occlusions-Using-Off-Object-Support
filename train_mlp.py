@@ -40,7 +40,7 @@ np.random.seed(125)
 B = 1
 S = 8
 N = 256 +1 # we need to load at least 4 i think
-lr = 1e-5
+lr = 1e-4
 grad_acc = 1
 
 crop_size = (368, 496)

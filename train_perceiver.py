@@ -45,7 +45,7 @@ grad_acc = 1
 crop_size = (368, 496)
 
 max_iters = 10000
-log_freq = 500
+log_freq = 10
 save_freq = 5000
 shuffle = False
 do_val = False
@@ -60,14 +60,14 @@ queries_dim = 27 + 2
 dim = 3
 feature_dim = 27
 num_band = 64
-k = 5      # visualize top k supporters
+k = 20      # visualize top k supporters
 
 log_dir = 'supporter_logs'
 video_name = "cache_len_1.mp4"
 model_name_suffix = 'cache_len_1'
 ckpt_dir = 'checkpoints'
 
-# model_path = 'checkpoints/01_8_65_1e-4_p1_traj_estimation_02:13:52.pth'  # where the ckpt is
+#model_path = 'checkpoints01_8_257_1e-4_p1_traj_estimation_01:09:52_cache_len_1.pth'  # where the ckpt is
 use_ckpt = False
 
 
@@ -276,7 +276,11 @@ def run_model(model, sample, criterion, sw):
         pred_traj[:, i] = torch.sum(norm_w * vote_pts, dim=0)[:, 0:2]
 
         if sw is not None and sw.save_this:
-            _, top_k_index = torch.topk(norm_w, k, dim=0)  # 5, 1, 1
+            try:
+                _, top_k_index = torch.topk(norm_w, k, dim=0)  # 5, 1, 1
+            except Exception:
+                k_temp = len(norm_w)
+                _, top_k_index = torch.topk(norm_w, k_temp, dim=0)
 
             k_supporter = supporters.index_select(0, top_k_index[:, 0, 0])  # 5, 1, 3
             k_votes = votes.index_select(0, top_k_index[:, 0, 0])
