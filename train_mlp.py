@@ -61,7 +61,7 @@ queries_dim = 27 + 2
 dim = 3
 feature_dim = 27
 num_band = 64
-k = 5      # visualize top k supporters
+k = 50      # visualize top k supporters
 
 log_dir = 'test_logs'
 video_name = "test_mlp.mp4"
@@ -223,7 +223,7 @@ def run_model(model, sample, criterion, sw):
     input_matrix = input_matrix.reshape(B, M, -1)
     input_matrix = input_matrix.transpose(0, 1)     # M, 1, 444
 
-    # use perceiver model instead of perceiver io
+    # use mlp model
     pred = model(input_matrix)  # M, 1, 6
 
     # generate voting features
