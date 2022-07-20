@@ -254,6 +254,8 @@ class Perceiver(nn.Module):
 
         # allow for fetching embeddings
 
+
+
         if return_embeddings:
             return x
 
