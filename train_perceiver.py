@@ -60,9 +60,13 @@ queries_dim = 27 + 2
 dim = 3
 feature_dim = 27
 num_band = 64
-k = 10      # visualize top k supporters
+k = 50      # visualize top k supporters
 
 log_dir = 'supporter_logs'
+video_name = "cache_len_1.mp4"
+model_name_suffix = 'cache_1en_1'
+# model_path = 'checkpoints/01_8_65_1e-4_p1_traj_estimation_02:13:52.pth'  # where the ckpt is
+use_ckpt = False
 
 
 def write_result(frame_lst, output_path, colored):
@@ -78,9 +82,15 @@ def write_result(frame_lst, output_path, colored):
     video.release()
 
 
-def draw_arrows(frame, supporters, votes):
+def draw_arrows(frame, supporters, votes, order=False):
+    # order: draw arrow & suggest its weights
 
     k, _ = supporters.shape
+    H, W, C = frame.shape
+    frame_gray = (0.299 * frame[:, :, 0]) + (0.587 * frame[:, :, 1]) + (0.114 * frame[:, :, 2])
+    frame_gray = frame_gray.reshape(H, W, 1).repeat(3, axis=-1)
+
+    frame = (frame_gray + frame)/2
 
     for idx in range(k):
         pt = supporters[idx]
@@ -91,7 +101,12 @@ def draw_arrows(frame, supporters, votes):
         end_x = int(pt[0] + dxy[0])
         end_y = int(pt[1] + dxy[1])
 
-        cv2.arrowedLine(frame, (start_x, start_y), (end_x, end_y), (255, 0, 0), 2, 9, 0, 0.3)
+        start_pt = (start_x, start_y)
+        end_pt = (end_x, end_y)
+
+        cv2.line(frame, start_pt, end_pt, (0, 255, 0))
+        cv2.rectangle(frame, (start_pt[0] - 2, start_pt[1] - 2), (start_pt[0] + 2, start_pt[1] + 2), (0, 0, 255))
+        cv2.rectangle(frame, (end_pt[0] - 2, end_pt[1] - 2), (end_pt[0] + 2, end_pt[1] + 2), (255, 0, 0))
 
     return frame
 
@@ -240,7 +255,7 @@ def run_model(model, sample, criterion, sw):
             frame = np.array(frame)[:, :, ::-1]
             frame = np.ascontiguousarray(frame, dtype=np.int32)    # H, W, C
 
-            frame_drawn = draw_arrows(frame, k_supporter[0].cpu().detach(), k_votes[0].cpu().detach())
+            frame_drawn = draw_arrows(frame, k_supporter[0].cpu().detach(), k_votes[0].cpu().detach(), order=False)
             frame_lst.append(np.array(frame_drawn, dtype=np.uint8))
 
     pred_traj = pred_traj.unsqueeze(-2)     # B, S, 1, 2
@@ -259,7 +274,7 @@ def run_model(model, sample, criterion, sw):
 
         sw.summ_rgbs('inputs_0/rgbs', utils.improc.preprocess_color(rgbs[0:1]).unbind(1))
         if len(frame_lst):
-            write_result(frame_lst, "test.mp4", True)
+            write_result(frame_lst, video_name, True)
 
     return total_loss
 
@@ -295,7 +310,7 @@ def train():
 
     import datetime
     model_date = datetime.datetime.now().strftime('%H:%M:%S')
-    model_name = model_name + '_' + model_date
+    model_name = model_name + '_' + model_date + '_' + model_name_suffix
     print('model_name', model_name)
 
     ckpt_dir = 'checkpoints/%s' % model_name + '.pth'
@@ -359,6 +374,10 @@ def train():
 
     model = model.cuda()
     model = torch.nn.DataParallel(model)
+
+    if use_ckpt:
+        state = torch.load(model_path)
+        model.load_state_dict(state, strict=False)
 
     criterion = nn.L1Loss()
     optimizer = optim.SGD(model.parameters(), lr=lr)
