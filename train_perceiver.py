@@ -38,7 +38,7 @@ np.random.seed(125)
 ## choose hyps
 B = 1
 S = 8
-N = 64 +1 # we need to load at least 4 i think
+N = 512 +1 # we need to load at least 4 i think
 lr = 1e-4
 grad_acc = 1
 
@@ -61,10 +61,11 @@ dim = 3
 feature_dim = 27
 num_band = 64
 k = 50      # visualize top k supporters
+M_min = 50  # at least use 50 trajs
 
-log_dir = 'supporter_logs'
-video_name = "cache_len_1.mp4"
-model_name_suffix = 'cache_1en_1'
+log_dir = 'test_logs'
+video_name = "test.mp4"
+model_name_suffix = 'test'
 # model_path = 'checkpoints/01_8_65_1e-4_p1_traj_estimation_02:13:52.pth'  # where the ckpt is
 use_ckpt = False
 
@@ -178,8 +179,23 @@ def run_model(model, sample, criterion, sw):
     end_loc = relative_pos[:, 1:, :, :]
 
     # parameter M indicate the number of trajs
-    M = (S-1) * (N-1)
-    short_traj = torch.concat([start_loc, end_loc], axis=-1).flatten(start_dim=-3, end_dim=-2)  # B, M, 6
+    short_traj = torch.concat([start_loc, end_loc], axis=-1).flatten(start_dim=-3, end_dim=-2)  # B, (S-1)*(N-1), 6
+
+    true_traj_mask = (0 < short_traj[:, :, 0]) & (short_traj[:, :, 0] < W-1) \
+                     & (0 < short_traj[:, :, 3]) & (short_traj[:, :, 3] < W - 1) \
+                     & (0 < short_traj[:, :, 1]) & (short_traj[:, :, 1] < H - 1) \
+                     & (0 < short_traj[:, :, 4]) & (short_traj[:, :, 4] < H - 1)
+
+    M = int(true_traj_mask.sum())
+
+    if M < M_min:
+        print("not enough trajectories. abandon this data")
+        return total_loss
+    else:
+       short_traj = torch.masked_select(short_traj, true_traj_mask.unsqueeze(-1).repeat(1, 1, 6))
+       short_traj = short_traj.reshape(B, M, -1)  # B, M, 6
+       short_traj = short_traj[:, :M_min, -1]
+
     # flatten along the S-1 dimension, so short_traj[0, :N-1] are trajs that begin at 0 and end at 1
 
     # 3d position encoding
@@ -198,10 +214,16 @@ def run_model(model, sample, criterion, sw):
     # generate input matrix through concat
     input_matrix = torch.concat([short_trajs_encoding, short_trajs_features], axis=-1)   # B, S-1, N-1, 444
     input_matrix = input_matrix.flatten(start_dim=-3, end_dim=-2)  # B, M, 444
+    _, _, feature_len = input_matrix.shape
+
+    # discard those false traj
+    input_matrix = torch.masked_select(input_matrix, true_traj_mask.unsqueeze(-1).repeat(1, 1, feature_len))
+    input_matrix = input_matrix.reshape(B, M, -1)
+    input_matrix = input_matrix[:, :M_min, :]
 
     # use perceiver model instead of perceiver io
-    pred = model(input_matrix)  # B, 6 * M ; Batch time(number of tokens) channel
-    pred = pred.reshape(B, M, -1)
+    pred = model(input_matrix)  #
+    pred = pred.reshape(B, M_min, -1)
 
     # generate voting features
     dx0 = pred[:, :, 0:1]
@@ -221,6 +243,7 @@ def run_model(model, sample, criterion, sw):
 
     frame_lst = []  # for visualization
 
+    # seperate trajs that belongs to different time step
     for i in range(S):
         step = N-1  # trajs num that start at time step i
 
@@ -363,7 +386,7 @@ def train():
     # model = PerceiverIO(depth=6, dim=S * (dim*(2*num_band+1) + feature_dim),
                         # queries_dim=queries_dim, logits_dim=logis_dim).to(device)
 
-    model = Perceiver(depth=6, fourier_encode_data=False, num_classes=6 * (N-1) * (S-1),
+    model = Perceiver(depth=6, fourier_encode_data=False, num_classes= 6 * M_min,
                       num_freq_bands=64,
                       max_freq=N,
                       input_axis=1,
