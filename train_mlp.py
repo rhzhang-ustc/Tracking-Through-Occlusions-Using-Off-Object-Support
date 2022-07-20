@@ -276,7 +276,11 @@ def run_model(model, sample, criterion, sw):
         pred_traj[:, i] = torch.sum(norm_w * vote_pts, dim=0)[:, 0:2]
 
         if sw is not None and sw.save_this:
-            _, top_k_index = torch.topk(norm_w, k, dim=0)  # 5, 1, 1
+            try:
+                _, top_k_index = torch.topk(norm_w, k, dim=0)  # 5, 1, 1
+            except Exception:
+                k_temp = len(norm_w)
+                _, top_k_index = torch.topk(norm_w, k_temp, dim=0)
 
             k_supporter = supporters.index_select(0, top_k_index[:, 0, 0])  # 5, 1, 3
             k_votes = votes.index_select(0, top_k_index[:, 0, 0])
