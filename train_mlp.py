@@ -29,6 +29,7 @@ import torch.nn.functional as F
 
 from perceiver_io import PerceiverIO
 from perceiver_pytorch import Perceiver
+from perceiver_pytorch import MLP
 
 device = 'cuda'
 patch_size = 8
@@ -39,7 +40,7 @@ np.random.seed(125)
 B = 1
 S = 8
 N = 256 +1 # we need to load at least 4 i think
-lr = 1e-4
+lr = 1e-5
 grad_acc = 1
 
 crop_size = (368, 496)
@@ -62,12 +63,12 @@ feature_dim = 27
 num_band = 64
 k = 5      # visualize top k supporters
 
-log_dir = 'supporter_logs'
-video_name = "cache_len_1.mp4"
-model_name_suffix = 'cache_len_1'
-ckpt_dir = 'checkpoints'
+log_dir = 'test_logs'
+video_name = "test_mlp.mp4"
+model_name_suffix = 'test_mlp'
+ckpt_dir = 'checkpoints_test'
 
-# model_path = 'checkpoints/01_8_65_1e-4_p1_traj_estimation_02:13:52.pth'  # where the ckpt is
+#model_path = 'checkpoints_test/01_8_257_1e-4_p1_traj_estimation_01:12:32_test.pth'  # where the ckpt is
 use_ckpt = False
 
 
@@ -223,8 +224,7 @@ def run_model(model, sample, criterion, sw):
     input_matrix = input_matrix.transpose(0, 1)     # M, 1, 444
 
     # use perceiver model instead of perceiver io
-    pred = model(input_matrix)  # M, 6
-    pred = pred.unsqueeze(-2)
+    pred = model(input_matrix)  # M, 1, 6
 
     # generate voting features
     dx0 = pred[:, :, 0:1]
@@ -391,18 +391,7 @@ def train():
 
     total_loss = torch.tensor(0.0, requires_grad=True).to(device)
 
-    # model = PerceiverIO(depth=6, dim=S * (dim*(2*num_band+1) + feature_dim),
-                        # queries_dim=queries_dim, logits_dim=logis_dim).to(device)
-
-    model = Perceiver(depth=6, fourier_encode_data=False, num_classes=6,
-                      num_freq_bands=64,
-                      max_freq=N,
-                      input_axis=1,
-                      num_latents=512,
-                      latent_dim=512,
-                      input_channels=2 * ((3*num_band+3) + feature_dim),
-                      final_classifier_head=True)
-
+    model = MLP(input_dim=2 * ((3*num_band+3) + feature_dim), output_dim=6)
     model = model.cuda()
     model = torch.nn.DataParallel(model)
 

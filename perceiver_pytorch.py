@@ -262,3 +262,16 @@ class Perceiver(nn.Module):
         # to logits
 
         return self.to_logits(x)
+
+
+class MLP(nn.Module):
+    def __init__(self, input_dim, output_dim, latent_dim=1024):
+
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, latent_dim),
+            nn.Linear(latent_dim, output_dim)
+        )
+
+    def forward(self, x):
+        return self.mlp(x)
