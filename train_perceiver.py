@@ -61,11 +61,12 @@ dim = 3
 feature_dim = 27
 num_band = 64
 k = 20      # visualize top k supporters
+feature_sample_step = 1
 
-log_dir = 'supporter_logs'
-video_name = "cache_len_1.mp4"
-model_name_suffix = 'cache_len_1'
-ckpt_dir = 'checkpoints'
+log_dir = 'test_logs'
+video_name = "test.mp4"
+model_name_suffix = 'test'
+ckpt_dir = 'checkpoints_test'
 
 #model_path = 'checkpoints01_8_257_1e-4_p1_traj_estimation_01:09:52_cache_len_1.pth'  # where the ckpt is
 use_ckpt = False
@@ -113,7 +114,7 @@ def draw_arrows(frame, supporters, votes, order=False):
     return frame
 
 
-def extract_frame_patches(frames, trajs, step=1):
+def extract_frame_patches(frames, trajs, step=feature_sample_step):
     # steps: dilate conv style
     # frames: (B, S, C, H, W)
     # trajs: (B, S, N, 2)
@@ -176,22 +177,25 @@ def run_model(model, sample, criterion, sw):
 
     # chop relative pos into short trajs:  B, S*(N-1), 3, 2
     # where 3, 2 means x0, y0, t0, x1, y1, t1 (start & end point)
-    start_loc = relative_pos[:, :-1, :, :]  # B, S-1, N-1, 3
-    end_loc = relative_pos[:, 1:, :, :]
+    start_loc = relative_pos[:, :-1, :, :].reshape(B, -1, 3)  # B, (S-1)*(N-1), 3
+    end_loc = relative_pos[:, 1:, :, :].reshape(B, -1, 3)
 
     # parameter M indicate the number of trajs
-    short_traj = torch.concat([start_loc, end_loc], axis=-1).flatten(start_dim=-3, end_dim=-2)  # B, (S-1)*(N-1), 6
+    short_traj = torch.concat([start_loc, end_loc], axis=-1)  # B, (S-1)*(N-1), 6
 
     true_traj_mask = (0 < short_traj[:, :, 0]) & (short_traj[:, :, 0] < W-1) \
                      & (0 < short_traj[:, :, 3]) & (short_traj[:, :, 3] < W - 1) \
                      & (0 < short_traj[:, :, 1]) & (short_traj[:, :, 1] < H - 1) \
                      & (0 < short_traj[:, :, 4]) & (short_traj[:, :, 4] < H - 1)
 
+    true_traj_mask = true_traj_mask.unsqueeze(-1)   # 1, M, 1
     M = int(true_traj_mask.sum())
 
-    short_traj = torch.masked_select(short_traj, true_traj_mask.unsqueeze(-1).repeat(1, 1, 6))
-    short_traj = short_traj.reshape(B, M, -1)  # B, M, 6
-    short_traj = short_traj.transpose(0, 1)     # M, 1, 6
+    short_traj = torch.masked_select(short_traj, true_traj_mask.repeat(1, 1, 6))
+    short_traj = short_traj.reshape(M, B, -1)  # M, 1, 6
+
+    start_loc = torch.masked_select(start_loc, true_traj_mask.repeat(1, 1, 3)).reshape(M, B, -1)  # M, 1, 3
+    end_loc = torch.masked_select(end_loc, true_traj_mask.repeat(1, 1, 3)).reshape(M, B, -1)
 
     # static: where is the split point that separate different time step
     traj_num_lst = []
@@ -200,33 +204,26 @@ def run_model(model, sample, criterion, sw):
         traj_num_lst.append(num_in_frame_i)
 
     # 3d position encoding
-    start_loc_encoding = utils.misc.get_3d_embedding(start_loc.reshape(-1, N-1, 3), num_band)
-    end_loc_encoding = utils.misc.get_3d_embedding(end_loc.reshape(-1, N-1, 3), num_band)
-    short_trajs_encoding = torch.concat([start_loc_encoding, end_loc_encoding], axis=-1)  # B*(S-1), N-1, 390
-    short_trajs_encoding = short_trajs_encoding.reshape(B, S-1, N-1, -1)
+    start_loc_encoding = utils.misc.get_3d_embedding(start_loc, num_band)
+    end_loc_encoding = utils.misc.get_3d_embedding(end_loc, num_band)
+    short_trajs_encoding = torch.concat([start_loc_encoding, end_loc_encoding], axis=-1)  # M, 1, 390
 
     # frame patches
-    frame_features = extract_frame_patches(rgbs, trajs, step=1).cuda().float()  # B, S, N-1, 27
+    frame_features = extract_frame_patches(rgbs, trajs, step=1).cuda().float()  # B, S-1, N-1, 27
     start_frame_features = frame_features[:, :-1, :, :]
     end_frame_feature = frame_features[:, 1:, :, :]
 
-    short_trajs_features = torch.concat([start_frame_features, end_frame_feature], axis=-1)
+    short_trajs_features = torch.concat([start_frame_features, end_frame_feature], axis=-1).reshape(B, -1, 2*feature_dim)
+    short_trajs_features = torch.masked_select(short_trajs_features, true_traj_mask.repeat(1, 1, 2*feature_dim)).reshape(M, B, -1)
 
     # generate input matrix through concat
-    input_matrix = torch.concat([short_trajs_encoding, short_trajs_features], axis=-1)   # B, S-1, N-1, 444
-    input_matrix = input_matrix.flatten(start_dim=-3, end_dim=-2)  # B, M, 444
-    _, _, feature_len = input_matrix.shape
-
-    # discard those false traj
-    input_matrix = torch.masked_select(input_matrix, true_traj_mask.unsqueeze(-1).repeat(1, 1, feature_len))
-    input_matrix = input_matrix.reshape(B, M, -1)
-    input_matrix = input_matrix.transpose(0, 1)     # M, 1, 444
+    input_matrix = torch.concat([short_trajs_encoding, short_trajs_features], axis=-1)   # M, 1, 444
 
     # use perceiver model instead of perceiver io
     pred = model(input_matrix)  # M, 6
-    pred = pred.unsqueeze(-2)
+    pred = pred.reshape(-1, 1, 6)   # M, 1, 6
 
-    # generate voting features
+    # generate voting features M, 1, 6
     dx0 = pred[:, :, 0:1]
     dy0 = pred[:, :, 1:2]
     dx1 = pred[:, :, 2:3]
@@ -249,7 +246,7 @@ def run_model(model, sample, criterion, sw):
 
         if i == 0:
             # supporters are points with x, y,t
-            supporters = short_traj[:traj_num_lst[0], :, :3]    # m, 1, 3
+            supporters = short_traj[:traj_num_lst[0], :, :3]    # m, 1, 3 (first 3 )
             votes = vote_matrix[:traj_num_lst[0], :, :3]
             w = w0[:traj_num_lst[0]]
 
@@ -273,17 +270,17 @@ def run_model(model, sample, criterion, sw):
 
         vote_pts = supporters + votes
         norm_w = torch.softmax(w, dim=0)
-        pred_traj[:, i] = torch.sum(norm_w * vote_pts, dim=0)[:, 0:2]
+        pred_traj[:, i] = torch.mean(norm_w * vote_pts, dim=0)[:, 0:2]
 
         if sw is not None and sw.save_this:
             try:
-                _, top_k_index = torch.topk(norm_w, k, dim=0)  # 5, 1, 1
+                _, top_k_index = torch.topk(norm_w, k, dim=0)  # M, 1, 1
             except Exception:
                 k_temp = len(norm_w)
-                _, top_k_index = torch.topk(norm_w, k_temp, dim=0)
+                _, top_k_index = torch.topk(norm_w, k_temp, dim=0)  # M
 
-            k_supporter = supporters.index_select(0, top_k_index[:, 0, 0])  # 5, 1, 3
-            k_votes = votes.index_select(0, top_k_index[:, 0, 0])
+            k_supporter = supporters.index_select(0, top_k_index[:, 0, 0])  # M, 1, 3
+            k_votes = votes.index_select(0, top_k_index[:, 0, 0])  # M ,1, 3
 
             frame = rgbs[0, i].transpose(0, 2).transpose(0, 1).cpu()
             frame = np.array(frame)[:, :, ::-1]
@@ -293,7 +290,7 @@ def run_model(model, sample, criterion, sw):
                                       k_votes[:, 0, :].cpu().detach(), order=False)
             frame_lst.append(np.array(frame_drawn, dtype=np.uint8))
 
-    pred_traj = pred_traj.unsqueeze(-2)     # B, S, 1, 2
+    pred_traj = pred_traj.reshape(B, S, 1, -1)     # B, S, 1, 2
     total_loss = criterion(target_traj, pred_traj)
 
     if sw is not None and sw.save_this:
