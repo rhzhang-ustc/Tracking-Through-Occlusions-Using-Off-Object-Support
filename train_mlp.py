@@ -40,7 +40,7 @@ np.random.seed(125)
 B = 1
 S = 8
 N = 256 +1 # we need to load at least 4 i think
-lr = 1e-4
+lr = 1e-5
 grad_acc = 1
 
 crop_size = (368, 496)
@@ -65,15 +65,14 @@ k = 50      # visualize top k supporters
 
 log_dir = 'test_logs'
 video_name = "test_mlp.mp4"
-model_name_suffix = 'test_mlp'
+model_name_suffix = 'test_mlp_continue'
 ckpt_dir = 'checkpoints_test'
 
-#model_path = 'checkpoints_test/01_8_257_1e-4_p1_traj_estimation_01:12:32_test.pth'  # where the ckpt is
-use_ckpt = False
+model_path = 'checkpoints_test/01_8_257_1e-4_p1_traj_estimation_00:37:03_test_mlp.pth'  # where the ckpt is
+use_ckpt = True
 
 
 def write_result(frame_lst, output_path, colored):
-
     frame_shape = frame_lst[0].shape
     video_size = (frame_shape[1], frame_shape[0])
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -85,15 +84,17 @@ def write_result(frame_lst, output_path, colored):
     video.release()
 
 
-def draw_arrows(frame, supporters, votes, order=False):
+def draw_arrows(frame, supporters, votes, groundtruth, pred, order=False):
     # order: draw arrow & suggest its weights
+    # N, 3: supporters / votes
+    # 1, 2: groundtruth /pred
 
     k, _ = supporters.shape
     H, W, C = frame.shape
     frame_gray = (0.299 * frame[:, :, 0]) + (0.587 * frame[:, :, 1]) + (0.114 * frame[:, :, 2])
     frame_gray = frame_gray.reshape(H, W, 1).repeat(3, axis=-1)
 
-    frame = (frame_gray + frame)/2
+    frame = (frame_gray + frame) / 2
 
     for idx in range(k):
         pt = supporters[idx]
@@ -107,9 +108,12 @@ def draw_arrows(frame, supporters, votes, order=False):
         start_pt = (start_x, start_y)
         end_pt = (end_x, end_y)
 
-        cv2.line(frame, start_pt, end_pt, (0, 255, 0))
-        cv2.rectangle(frame, (start_pt[0] - 2, start_pt[1] - 2), (start_pt[0] + 2, start_pt[1] + 2), (0, 0, 255))
-        cv2.rectangle(frame, (end_pt[0] - 2, end_pt[1] - 2), (end_pt[0] + 2, end_pt[1] + 2), (255, 0, 0))
+        cv2.line(frame, start_pt, end_pt, (255, 0, 0))
+        # cv2.rectangle(frame, (start_pt[0] - 2, start_pt[1] - 2), (start_pt[0] + 2, start_pt[1] + 2), (0, 0, 255))
+        cv2.rectangle(frame, (end_pt[0] - 1, end_pt[1] - 1), (end_pt[0] + 1, end_pt[1] + 1), (255, 0, 0))
+
+    cv2.circle(frame, (int(groundtruth[0]), int(groundtruth[1])), 4, (0, 0, 255))
+    cv2.circle(frame, (int(pred[0]), int(pred[1])), 4, (255, 0, 0))
 
     return frame
 
@@ -127,8 +131,8 @@ def extract_frame_patches(frames, trajs, step=1):
     x = trajs[:, :, :, 0:1].clone().detach().int()  # B, S, N, 1
     y = trajs[:, :, :, 1:].clone().detach().int()
 
-    x_range = torch.concat([x-step, x, x+step], axis=-1).unsqueeze(-1)  # B, S, N, 3, 1
-    y_range = torch.concat([y-step, y, y+step], axis=-1).unsqueeze(-2)  # B, S, N, 1, 3
+    x_range = torch.concat([x - step, x, x + step], axis=-1).unsqueeze(-1)  # B, S, N, 3, 1
+    y_range = torch.concat([y - step, y, y + step], axis=-1).unsqueeze(-2)  # B, S, N, 1, 3
 
     grid_x = x_range.repeat(1, 1, 1, 1, 3).flatten(start_dim=-2)  # meshgrid, B, S, N, 9
     grid_y = y_range.repeat(1, 1, 1, 3, 1).flatten(start_dim=-2)
@@ -139,9 +143,10 @@ def extract_frame_patches(frames, trajs, step=1):
         for i in range(3):
             for j in range(3):
                 temp = utils.samp.bilinear_sample2d(frames[:, s],
-                                                    grid_x[:, s, :, i], grid_y[:, s, :, j])  # B, C, N
+                                                    grid_x[:, s, :, i],
+                                                    grid_y[:, s, :, j])  # B, C, N
 
-                output[:, s, :, :, 3*i+j] = temp.transpose(1, 2)
+                output[:, s, :, :, 3 * i + j] = temp.transpose(1, 2)
 
     # reshape, B, S, N, C*(2*step+1)*(2*step+1)
     output = output.flatten(start_dim=-2)
@@ -150,7 +155,6 @@ def extract_frame_patches(frames, trajs, step=1):
 
 
 def run_model(model, sample, criterion, sw):
-
     total_loss = torch.tensor(0.0, requires_grad=True).to(device)
 
     rgbs = torch.from_numpy(sample['rgbs']).cuda().float()  # B, S, C, H, W
@@ -160,73 +164,94 @@ def run_model(model, sample, criterion, sw):
     B, S, C, H, W = rgbs.shape
     _, _, N, _ = trajs.shape
 
-    # generate target: one trajectory that needs to be estimate
-    # then delete the point from trajs
-    target_traj = trajs[:, :, 0:1, :]   # B, S, 1, 2
-    start_target_traj = target_traj[:, 0:1, :, :]   # B, 1, 1, 2
+    '''
+    generate target: one trajectory that needs to be estimate
+    then delete the point from trajs
+    '''
+    target_traj = trajs[:, :, 0:1, :]  # B, S, 1, 2
+    start_target_traj = target_traj[:, 0:1, :, :]  # B, 1, 1, 2
 
     trajs = trajs[:, :, 1:, :]  # B, S, N-1, 2
-    relative_traj = trajs - start_target_traj   # B, S, N-1, 2
+    relative_traj = trajs - start_target_traj  # B, S, N-1, 2
 
     # 3d position encoding
     t_pos = torch.arange(0, S).cuda().float()
-    t_pos = t_pos.repeat([B, N-1, 1]).unsqueeze(-1)  # B, N-1, S, 1
-    t_pos = t_pos.transpose(1, 2)   # B, S, N-1, 1
+    t_pos = t_pos.repeat([B, N - 1, 1]).unsqueeze(-1)  # B, N-1, S, 1
+    t_pos = t_pos.transpose(1, 2)  # B, S, N-1, 1
 
     relative_pos = torch.concat([relative_traj, t_pos], axis=-1)  # B, S, N-1, 3
 
-    # chop relative pos into short trajs:  B, S*(N-1), 3, 2
-    # where 3, 2 means x0, y0, t0, x1, y1, t1 (start & end point)
-    start_loc = relative_pos[:, :-1, :, :]  # B, S-1, N-1, 3
-    end_loc = relative_pos[:, 1:, :, :]
+    '''
+    chop relative pos into short trajs:  B, S*(N-1), 3, 2
+    where 3, 2 means x0, y0, t0, x1, y1, t1 (start & end point)
+    '''
+    start_loc = relative_pos[:, :-1, :, :].reshape(B, -1, 3)  # B, (S-1)*(N-1), 3
+    end_loc = relative_pos[:, 1:, :, :].reshape(B, -1, 3)
 
     # parameter M indicate the number of trajs
-    short_traj = torch.concat([start_loc, end_loc], axis=-1).flatten(start_dim=-3, end_dim=-2)  # B, (S-1)*(N-1), 6
+    short_traj = torch.concat([start_loc, end_loc], axis=-1)  # B, (S-1)*(N-1), 6
 
-    true_traj_mask = (0 < short_traj[:, :, 0]) & (short_traj[:, :, 0] < W-1) \
+    true_traj_mask = (0 < short_traj[:, :, 0]) & (short_traj[:, :, 0] < W - 1) \
                      & (0 < short_traj[:, :, 3]) & (short_traj[:, :, 3] < W - 1) \
                      & (0 < short_traj[:, :, 1]) & (short_traj[:, :, 1] < H - 1) \
                      & (0 < short_traj[:, :, 4]) & (short_traj[:, :, 4] < H - 1)
 
+    true_traj_mask = true_traj_mask.unsqueeze(-1)  # 1, M, 1
     M = int(true_traj_mask.sum())
 
-    short_traj = torch.masked_select(short_traj, true_traj_mask.unsqueeze(-1).repeat(1, 1, 6))
-    short_traj = short_traj.reshape(B, M, -1)  # B, M, 6
-    short_traj = short_traj.transpose(0, 1)     # M, 1, 6
+    '''
+    filter the data
+    '''
+    short_traj = torch.masked_select(short_traj, true_traj_mask.repeat(1, 1, 6))
+    short_traj = short_traj.reshape(M, B, -1)  # M, 1, 6
+
+    start_loc = torch.masked_select(start_loc, true_traj_mask.repeat(1, 1, 3)).reshape(M, B, -1)  # M, 1, 3
+    end_loc = torch.masked_select(end_loc, true_traj_mask.repeat(1, 1, 3)).reshape(M, B, -1)
 
     # static: where is the split point that separate different time step
     traj_num_lst = []
-    for i in range(S-1):
+    for i in range(S - 1):
         num_in_frame_i = len([item for item in short_traj if item[0, 2] == i])  # number of trajs that start at frame i
         traj_num_lst.append(num_in_frame_i)
 
-    # 3d position encoding
-    start_loc_encoding = utils.misc.get_3d_embedding(start_loc.reshape(-1, N-1, 3), num_band)
-    end_loc_encoding = utils.misc.get_3d_embedding(end_loc.reshape(-1, N-1, 3), num_band)
-    short_trajs_encoding = torch.concat([start_loc_encoding, end_loc_encoding], axis=-1)  # B*(S-1), N-1, 390
-    short_trajs_encoding = short_trajs_encoding.reshape(B, S-1, N-1, -1)
+    '''
+    3d position encoding
+    '''
+    start_loc_encoding = utils.misc.get_3d_embedding(start_loc, num_band)
+    end_loc_encoding = utils.misc.get_3d_embedding(end_loc, num_band)
+    short_trajs_encoding = torch.concat([start_loc_encoding, end_loc_encoding], axis=-1)  # M, 1, 390
 
-    # frame patches
-    frame_features = extract_frame_patches(rgbs, trajs, step=1).cuda().float()  # B, S, N-1, 27
+    '''
+    frame patches
+    '''
+    frame_features = extract_frame_patches(rgbs, trajs, step=1).cuda().float()  # B, S-1, N-1, 27
     start_frame_features = frame_features[:, :-1, :, :]
     end_frame_feature = frame_features[:, 1:, :, :]
 
-    short_trajs_features = torch.concat([start_frame_features, end_frame_feature], axis=-1)
+    short_trajs_features = torch.concat([start_frame_features, end_frame_feature], axis=-1).reshape(B, -1,
+                                                                                                    2 * feature_dim)
+    short_trajs_features = torch.masked_select(short_trajs_features,
+                                               true_traj_mask.repeat(1, 1, 2 * feature_dim)).reshape(M, B, -1)
 
-    # generate input matrix through concat
-    input_matrix = torch.concat([short_trajs_encoding, short_trajs_features], axis=-1)   # B, S-1, N-1, 444
-    input_matrix = input_matrix.flatten(start_dim=-3, end_dim=-2)  # B, M, 444
-    _, _, feature_len = input_matrix.shape
+    '''
+    relative motion
+    '''
+    target_motion = (target_traj[:, 1:2, :, :] - start_target_traj)[0]  # 1, 1, 2
+    target_motion = torch.concat([target_motion, torch.ones(1, 1, 1).cuda().float()], dim=-1)  # 1, 1, 3
+    motion = end_loc - start_loc  # M, 1, 3
+    relative_motion = motion - target_motion
 
-    # discard those false traj
-    input_matrix = torch.masked_select(input_matrix, true_traj_mask.unsqueeze(-1).repeat(1, 1, feature_len))
-    input_matrix = input_matrix.reshape(B, M, -1)
-    input_matrix = input_matrix.transpose(0, 1)     # M, 1, 444
+    '''
+    use mlp model
+    '''
+    input_matrix = torch.concat([short_trajs_encoding, short_trajs_features, relative_motion], axis=-1)  # M, 1, 444 + 3
 
-    # use mlp model
-    pred = model(input_matrix)  # M, 1, 6
+    pred = model(input_matrix)  # M, 6
+    pred = pred.reshape(-1, 1, 6)  # M, 1, 6
 
-    # generate voting features
+    '''
+    generate voting features M, 1, 6
+    '''
     dx0 = pred[:, :, 0:1]
     dy0 = pred[:, :, 1:2]
     dx1 = pred[:, :, 2:3]
@@ -238,38 +263,50 @@ def run_model(model, sample, criterion, sw):
 
     # make sure that w are normalized inside the same timestep
     # generate prediction
-
-    vote_matrix = torch.concat([dx0, dy0, dt, dx1, dy1, dt], dim=-1)    # M, 1, 6
+    vote_matrix = torch.concat([dx0, dy0, dt, dx1, dy1, dt], dim=-1)  # M, 1, 6
     pred_traj = torch.zeros(B, S, 2).cuda().float()
 
     frame_lst = []  # for visualization
 
-    # seperate trajs that belongs to different time step
+    # separate trajs that belongs to different time step
+    # print supporters to check its validity
     for i in range(S):
 
         if i == 0:
             # supporters are points with x, y,t
-            supporters = short_traj[:traj_num_lst[0], :, :3]    # m, 1, 3
+            supporters = short_traj[:traj_num_lst[0], :, :3]  # m, 1, 3 (first 3 )
             votes = vote_matrix[:traj_num_lst[0], :, :3]
             w = w0[:traj_num_lst[0]]
 
-        elif i == S-1:
+        elif i == S - 1:
             end_at_frame_i = sum(traj_num_lst[:-1])
             supporters = short_traj[end_at_frame_i:, :, 3:6]
             votes = vote_matrix[end_at_frame_i:, :, 3:6]
             w = w1[end_at_frame_i:]
 
         else:
-            start_at_frame_i = sum(traj_num_lst[:i])    # trajs that has timestep (i, i+1)
-            end_at_frame_i = sum(traj_num_lst[:i-1])    # trajs that has timestep (i-1, i)
+            start_at_frame_i = sum(traj_num_lst[:i])  # trajs that has timestep (i, i+1)
+            end_at_frame_i = sum(traj_num_lst[:i - 1])  # trajs that has timestep (i-1, i)
 
-            # short trajs has shape M, 1, 6 so need to be split in the 0 dimension
-            supporters = torch.concat([short_traj[start_at_frame_i: start_at_frame_i + traj_num_lst[i], :, :3],      # start at frame i
-                                       short_traj[end_at_frame_i:end_at_frame_i + traj_num_lst[i-1], :, 3:6]], axis=0)  # end at frame i
+            '''
+            pts_from_start_loc: points that is the start of a trajectory & belong to frame i
+            pts_from_end_loc: points that is the end of a trajectory & belong to frame i
+
+            a single frame contains points from two part: start point & end point of trajs
+            '''
+
+            pts_from_start_loc = short_traj[start_at_frame_i: start_at_frame_i + traj_num_lst[i], :, :3]
+            pts_from_end_loc = short_traj[end_at_frame_i:end_at_frame_i + traj_num_lst[i - 1], :, 3:6]
+
+            supporters = torch.concat([pts_from_start_loc, pts_from_end_loc], axis=0)
+
             votes = torch.concat([vote_matrix[start_at_frame_i: start_at_frame_i + traj_num_lst[i], :, :3],
-                                  vote_matrix[end_at_frame_i:end_at_frame_i + traj_num_lst[i-1], :, 3:6]], axis=0)
+                                  vote_matrix[end_at_frame_i:end_at_frame_i + traj_num_lst[i - 1], :, 3:6]], axis=0)
             w = torch.concat([w0[start_at_frame_i: start_at_frame_i + traj_num_lst[i]],
-                              w1[end_at_frame_i:end_at_frame_i + traj_num_lst[i-1]]], axis=0)
+                              w1[end_at_frame_i:end_at_frame_i + traj_num_lst[i - 1]]], axis=0)
+
+        # print(i)
+        # print(supporters)     # results should have same timestep
 
         vote_pts = supporters + votes
         norm_w = torch.softmax(w, dim=0)
@@ -277,23 +314,27 @@ def run_model(model, sample, criterion, sw):
 
         if sw is not None and sw.save_this:
             try:
-                _, top_k_index = torch.topk(norm_w, k, dim=0)  # 5, 1, 1
+                _, top_k_index = torch.topk(norm_w, k, dim=0)  # M, 1, 1
             except Exception:
                 k_temp = len(norm_w)
-                _, top_k_index = torch.topk(norm_w, k_temp, dim=0)
+                _, top_k_index = torch.topk(norm_w, k_temp, dim=0)  # M
 
-            k_supporter = supporters.index_select(0, top_k_index[:, 0, 0])  # 5, 1, 3
-            k_votes = votes.index_select(0, top_k_index[:, 0, 0])
+            k_supporter = supporters.index_select(0, top_k_index[:, 0, 0])  # M, 1, 3
+            k_votes = votes.index_select(0, top_k_index[:, 0, 0])  # M ,1, 3
 
             frame = rgbs[0, i].transpose(0, 2).transpose(0, 1).cpu()
             frame = np.array(frame)[:, :, ::-1]
-            frame = np.ascontiguousarray(frame, dtype=np.int32)    # H, W, C
+            frame = np.ascontiguousarray(frame, dtype=np.int32)  # H, W, C
 
             frame_drawn = draw_arrows(frame, k_supporter[:, 0, :].cpu().detach(),
-                                      k_votes[:, 0, :].cpu().detach(), order=False)
+                                      k_votes[:, 0, :].cpu().detach(),
+                                      target_traj[0, i, 0],
+                                      pred_traj[0, i],
+                                      order=False)
+
             frame_lst.append(np.array(frame_drawn, dtype=np.uint8))
 
-    pred_traj = pred_traj.unsqueeze(-2)     # B, S, 1, 2
+    pred_traj = pred_traj.reshape(B, S, 1, -1)  # B, S, 1, 2
     total_loss = criterion(target_traj, pred_traj)
 
     if sw is not None and sw.save_this:
@@ -395,7 +436,7 @@ def train():
 
     total_loss = torch.tensor(0.0, requires_grad=True).to(device)
 
-    model = MLP(input_dim=2 * ((3*num_band+3) + feature_dim), output_dim=6)
+    model = MLP(input_dim=2 * ((3*num_band+3) + feature_dim)+3, output_dim=6)
     model = model.cuda()
     model = torch.nn.DataParallel(model)
 

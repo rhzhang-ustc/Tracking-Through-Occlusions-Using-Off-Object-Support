@@ -270,6 +270,7 @@ class MLP(nn.Module):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, latent_dim),
+            nn.ReLU(),
             nn.Linear(latent_dim, output_dim)
         )
 

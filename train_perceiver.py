@@ -3,6 +3,9 @@ import numpy as np
 import matplotlib
 import argparse
 import cv2
+import os
+
+os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3'
 
 matplotlib.use('Agg')  # suppress plot showing
 import utils.py
@@ -30,7 +33,12 @@ import torch.nn.functional as F
 from perceiver_io import PerceiverIO
 from perceiver_pytorch import Perceiver
 
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+
 device = 'cuda'
+device_ids = [0, 1, 2, 3]
 patch_size = 8
 random.seed(125)
 np.random.seed(125)
@@ -60,15 +68,15 @@ queries_dim = 27 + 2
 dim = 3
 feature_dim = 27
 num_band = 64
-k = 20      # visualize top k supporters
+k = 50      # visualize top k supporters
 feature_sample_step = 1
 
-log_dir = 'test_logs'
-video_name = "test.mp4"
-model_name_suffix = 'test'
-ckpt_dir = 'checkpoints_test'
+log_dir = 'supporter_logs'
+video_name = "cache_len_100.mp4"    # using cache=15 !!!
+model_name_suffix = 'cache_len_100'
+ckpt_dir = 'checkpoints'
 
-#model_path = 'checkpoints01_8_257_1e-4_p1_traj_estimation_01:09:52_cache_len_1.pth'  # where the ckpt is
+# model_path = 'checkpoints_test/01_8_257_5e-4_p1_traj_estimation_00:16:31_test.pth'  # where the ckpt is
 use_ckpt = False
 
 
@@ -109,12 +117,12 @@ def draw_arrows(frame, supporters, votes, groundtruth, pred, order=False):
         start_pt = (start_x, start_y)
         end_pt = (end_x, end_y)
 
-        cv2.line(frame, start_pt, end_pt, (0, 0, 255))
+        cv2.line(frame, start_pt, end_pt, (255, 0, 0))
         # cv2.rectangle(frame, (start_pt[0] - 2, start_pt[1] - 2), (start_pt[0] + 2, start_pt[1] + 2), (0, 0, 255))
-        cv2.rectangle(frame, (end_pt[0] - 1, end_pt[1] - 1), (end_pt[0] + 1, end_pt[1] + 1), (0, 0, 255))
+        cv2.rectangle(frame, (end_pt[0] - 1, end_pt[1] - 1), (end_pt[0] + 1, end_pt[1] + 1), (255, 0, 0))
 
-    cv2.circle(frame, (int(groundtruth[0]), int(groundtruth[1])), 4, (255, 0, 0))
-    cv2.circle(frame, (int(pred[0]), int(pred[1])), 4, (0, 0, 255))
+    cv2.circle(frame, (int(groundtruth[0]), int(groundtruth[1])), 4, (0, 0, 255))
+    cv2.circle(frame, (int(pred[0]), int(pred[1])), 4, (255, 0, 0))
 
     return frame
 
@@ -201,6 +209,10 @@ def run_model(model, sample, criterion, sw):
     true_traj_mask = true_traj_mask.unsqueeze(-1)   # 1, M, 1
     M = int(true_traj_mask.sum())
 
+    if M <= 0:
+        print('false data')
+        return total_loss
+
     '''
     filter the data
     '''
@@ -244,7 +256,8 @@ def run_model(model, sample, criterion, sw):
     '''
     use perceiver model instead of perceiver io
     '''
-    input_matrix = torch.concat([short_trajs_encoding, short_trajs_features, relative_motion], axis=-1)  # M, 1, 444+3
+    input_matrix = torch.concat([short_trajs_encoding, short_trajs_features, relative_motion], axis=-1)  # M, 1, 444
+
     pred = model(input_matrix)  # M, 6
     pred = pred.reshape(-1, 1, 6)   # M, 1, 6
 
@@ -309,7 +322,7 @@ def run_model(model, sample, criterion, sw):
 
         vote_pts = supporters + votes
         norm_w = torch.softmax(w, dim=0)
-        pred_traj[:, i] = torch.mean(norm_w * vote_pts, dim=0)[:, 0:2]
+        pred_traj[:, i] = torch.sum(norm_w * vote_pts, dim=0)[:, 0:2]
 
         if sw is not None and sw.save_this:
             try:
@@ -401,6 +414,7 @@ def train():
         use_augs=use_augs,
         N=N, S=S,
         crop_size=crop_size)
+
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=B,
@@ -438,7 +452,7 @@ def train():
     # model = PerceiverIO(depth=6, dim=S * (dim*(2*num_band+1) + feature_dim),
                         # queries_dim=queries_dim, logits_dim=logis_dim).to(device)
 
-    model = Perceiver(depth=6, fourier_encode_data=False, num_classes=6,
+    model = Perceiver(depth=1, fourier_encode_data=False, num_classes=6,
                       num_freq_bands=64,
                       max_freq=N,
                       input_axis=1,
@@ -447,8 +461,8 @@ def train():
                       input_channels=2 * ((3*num_band+3) + feature_dim) + 3,
                       final_classifier_head=True)
 
-    model = model.cuda()
-    model = torch.nn.DataParallel(model)
+    model = model.to(device)
+    model = torch.nn.DataParallel(model, device_ids=device_ids)
 
     if use_ckpt:
         state = torch.load(model_path)
@@ -551,6 +565,7 @@ def train():
 
 if __name__ == '__main__':
     # init argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--max_iters', type=int, help='iteration numbers',
                         default=10000)
@@ -558,10 +573,12 @@ if __name__ == '__main__':
                         default=True)
     parser.add_argument('--cache_len', type=int, help='cache len',
                         default=1)
+
     args = parser.parse_args()
 
     cache = args.use_cache
     max_iters = args.max_iters
     cache_len = args.cache_len
+
 
     train()
