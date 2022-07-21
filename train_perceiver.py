@@ -256,7 +256,7 @@ def run_model(model, sample, criterion, sw):
     '''
     use perceiver model instead of perceiver io
     '''
-    input_matrix = torch.concat([short_trajs_encoding, short_trajs_features, relative_motion], axis=-1)  # M, 1, 444
+    input_matrix = torch.concat([short_trajs_encoding, short_trajs_features, relative_motion], axis=-1)  # M, 1, 447
 
     pred = model(input_matrix)  # M, 6
     pred = pred.reshape(-1, 1, 6)   # M, 1, 6
