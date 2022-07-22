@@ -47,12 +47,12 @@ np.random.seed(125)
 B = 1
 S = 8
 N = 256 +1 # we need to load at least 4 i think
-lr = 1e-4
+lr = 1e-5
 grad_acc = 1
 
 crop_size = (368, 496)
 
-max_iters = 30000
+max_iters = 10000
 log_freq = 1000
 save_freq = 5000
 shuffle = False
@@ -64,19 +64,20 @@ use_augs = False
 
 val_freq = 10
 
+model_depth = 1
 queries_dim = 27 + 2
 dim = 3
 feature_dim = 27
 num_band = 64
-k = 50      # visualize top k supporters
+k = 10      # visualize top k supporters
 feature_sample_step = 1
 
-log_dir = 'supporter_logs'
+log_dir = 'test_logs'
 video_name = "cache_len_1.mp4"    # using cache=15 !!!
-model_name_suffix = 'cache_len_1'
-ckpt_dir = 'checkpoints'
+model_name_suffix = 'test'
+ckpt_dir = 'checkpoints_test'
 
-# model_path = 'checkpoints_test/01_8_257_5e-4_p1_traj_estimation_00:16:31_test.pth'  # where the ckpt is
+# model_path = 'checkpoints/01_8_257_1e-5_p1_traj_estimation_19:43:07_cache_len_1_continue.pth'  # where the ckpt is
 use_ckpt = False
 
 
@@ -266,9 +267,8 @@ def run_model(model, sample, criterion, sw):
     start_vote_matrix = torch.concat([dx0, dy0, dt], dim=-1)    # M, 1, 3
     end_vote_matrix = torch.concat([dx1, dy1, dt], dim=-1)
 
-    pred_traj = torch.zeros(B, S, 2).cuda().float()
-
     frame_lst = []  # for visualization
+    pred_traj = torch.zeros(B, S, 1, 2)
 
     # separate trajs that belongs to different time step
     for i in range(S):
@@ -286,46 +286,45 @@ def run_model(model, sample, criterion, sw):
         vote_pts = supporters + votes
         norm_w = torch.softmax(w, dim=0)
 
-        pred_traj[:, i] = torch.sum(norm_w * vote_pts, dim=0)[0:2]
+        pred_traj_i = torch.sum(norm_w * vote_pts, dim=0)[None, 0:2]
+        pred_traj[:, i, :, :] = pred_traj_i
+
+        target_traj_i = target_traj[0, i]   # 1, 2
+
+        total_loss += criterion(pred_traj_i, target_traj_i)
 
         '''
-        force the first frame to has the right prediction (all point to the start point)
-        dx, dy at the first frame should be right
+        additional loss: force topk points to have reasonable result
         '''
-        if i == 0:
-            start_target_traj = start_target_traj[:, 0, 0, :]   # 1, 2
-            ground_vote_matrix = start_target_traj - supporters[:, :2]   # M, 2
-            total_loss += criterion(ground_vote_matrix, votes[:, :2])
+
+        try:
+            k_temp = k
+            _, top_k_index = torch.topk(norm_w, k_temp, dim=0)  # M, 1
+        except Exception:
+            k_temp = len(norm_w)
+            _, top_k_index = torch.topk(norm_w, k_temp, dim=0)
+
+        k_supporter = supporters.index_select(0, top_k_index[:, 0])  # M, 3
+        k_votes = votes.index_select(0, top_k_index[:, 0])  # M , 3
+
+        pred_matrix = (k_supporter + k_votes)[:, 0:2]
+        total_loss += criterion(pred_matrix, target_traj_i.repeat(k_temp, 1))
 
         '''
         visualization
         '''
         if sw is not None and sw.save_this:
-            try:
-                _, top_k_index = torch.topk(norm_w, k, dim=0)  # M, 1
-            except Exception:
-                k_temp = len(norm_w)
-                _, top_k_index = torch.topk(norm_w, k_temp, dim=0)
-
-            k_supporter = supporters.index_select(0, top_k_index[:, 0])  # M, 3
-            k_votes = votes.index_select(0, top_k_index[:, 0])  # M , 3
-
             frame = rgbs[0, i].transpose(0, 2).transpose(0, 1).cpu()
             frame = np.array(frame)[:, :, ::-1]
             frame = np.ascontiguousarray(frame, dtype=np.int32)    # H, W, C
 
             frame_drawn = draw_arrows(frame, k_supporter.cpu().detach(),
                                       k_votes.cpu().detach(),
-                                      target_traj[0, i, 0],
-                                      pred_traj[0, i],
+                                      target_traj_i,
+                                      pred_traj_i,
                                       order=False)
 
             frame_lst.append(np.array(frame_drawn, dtype=np.uint8))
-
-    pred_traj = pred_traj.reshape(B, S, 1, -1)     # B, S, 1, 2
-    total_loss += criterion(target_traj, pred_traj)
-
-
 
     if sw is not None and sw.save_this:
 
@@ -342,7 +341,7 @@ def run_model(model, sample, criterion, sw):
         if len(frame_lst):
             write_result(frame_lst, video_name, True)
 
-    return total_loss
+    return total_loss/S
 
 
 def train():
@@ -430,7 +429,7 @@ def train():
     # model = PerceiverIO(depth=6, dim=S * (dim*(2*num_band+1) + feature_dim),
                         # queries_dim=queries_dim, logits_dim=logis_dim).to(device)
 
-    model = Perceiver(depth=1, fourier_encode_data=False, num_classes=6,
+    model = Perceiver(depth=model_depth, fourier_encode_data=False, num_classes=6,
                       num_freq_bands=64,
                       max_freq=N,
                       input_axis=1,
