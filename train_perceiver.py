@@ -46,14 +46,14 @@ np.random.seed(125)
 ## choose hyps
 B = 1
 S = 8
-N = 256 +1 # we need to load at least 4 i think
-lr = 1e-4
+N = 56 +1 # we need to load at least 4 i think
+lr = 1e-5
 grad_acc = 1
 
 crop_size = (368, 496)
 
 max_iters = 10000
-log_freq = 1000
+log_freq = 100
 save_freq = 5000
 shuffle = False
 do_val = False
@@ -73,13 +73,13 @@ num_band = 64
 k = 10      # visualize top k supporters
 feature_sample_step = 1
 
-log_dir = 'supporter_logs'
-video_name = "cache_len_15.mp4"
-model_name_suffix = 'cache_len_15'
-ckpt_dir = 'checkpoints'
+log_dir = 'test_logs'
+video_name = "test.mp4"
+model_name_suffix = 'test'
+ckpt_dir = 'checkpoints_test'
 
-# model_path = 'checkpoints/01_8_257_1e-5_p1_traj_estimation_19:43:07_cache_len_1_continue.pth'  # where the ckpt is
-use_ckpt = False
+model_path = 'checkpoints/01_8_257_1e-4_p1_traj_estimation_00:52:54_cache_len_15.pth'  # where the ckpt is
+use_ckpt = True
 
 
 def write_result(frame_lst, output_path, colored):
@@ -212,6 +212,7 @@ def run_model(model, sample, criterion, sw):
         print('false data')
         return total_loss
 
+
     '''
     filter the data
     '''
@@ -247,6 +248,7 @@ def run_model(model, sample, criterion, sw):
     use perceiver model instead of perceiver io
     '''
     input_matrix = torch.concat([short_trajs_encoding, short_trajs_features, relative_motion], axis=-1)  # M, 1, 447
+    input_matrix = input_matrix.to(device)
 
     pred = model(input_matrix)  # M, 6
     pred = pred.reshape(-1, 1, 6)   # M, 1, 6

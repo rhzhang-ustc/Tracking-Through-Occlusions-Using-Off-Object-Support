@@ -8,6 +8,8 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from einops.layers.torch import Reduce
 
+from torch.utils.checkpoint import checkpoint
+
 # helpers
 
 def exists(val):
@@ -253,8 +255,6 @@ class Perceiver(nn.Module):
                 x = self_ff(x) + x
 
         # allow for fetching embeddings
-
-
 
         if return_embeddings:
             return x
