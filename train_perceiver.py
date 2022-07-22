@@ -47,7 +47,7 @@ np.random.seed(125)
 B = 1
 S = 8
 N = 256 +1 # we need to load at least 4 i think
-lr = 1e-5
+lr = 1e-4
 grad_acc = 1
 
 crop_size = (368, 496)
@@ -65,6 +65,7 @@ use_augs = False
 val_freq = 10
 
 model_depth = 1
+
 queries_dim = 27 + 2
 dim = 3
 feature_dim = 27
@@ -72,10 +73,10 @@ num_band = 64
 k = 10      # visualize top k supporters
 feature_sample_step = 1
 
-log_dir = 'test_logs'
-video_name = "cache_len_1.mp4"    # using cache=15 !!!
-model_name_suffix = 'test'
-ckpt_dir = 'checkpoints_test'
+log_dir = 'supporter_logs'
+video_name = "cache_len_15.mp4"
+model_name_suffix = 'cache_len_15'
+ckpt_dir = 'checkpoints'
 
 # model_path = 'checkpoints/01_8_257_1e-5_p1_traj_estimation_19:43:07_cache_len_1_continue.pth'  # where the ckpt is
 use_ckpt = False
@@ -276,6 +277,9 @@ def run_model(model, sample, criterion, sw):
         idx_start = start_loc[:, :, -1] == i
         idx_end = end_loc[:, :, -1] == i
 
+        if torch.sum(idx_start) + torch.sum(idx_end) == 0:
+            continue
+
         supporters_start_loc = start_loc[idx_start]
         supporters_end_loc = end_loc[idx_end]
         supporters = torch.concat([supporters_start_loc, supporters_end_loc], dim=0)    # M, 3
@@ -296,7 +300,6 @@ def run_model(model, sample, criterion, sw):
         '''
         additional loss: force topk points to have reasonable result
         '''
-
         try:
             k_temp = k
             _, top_k_index = torch.topk(norm_w, k_temp, dim=0)  # M, 1
@@ -320,8 +323,8 @@ def run_model(model, sample, criterion, sw):
 
             frame_drawn = draw_arrows(frame, k_supporter.cpu().detach(),
                                       k_votes.cpu().detach(),
-                                      target_traj_i,
-                                      pred_traj_i,
+                                      target_traj_i[0],
+                                      pred_traj_i[0],
                                       order=False)
 
             frame_lst.append(np.array(frame_drawn, dtype=np.uint8))
