@@ -5,7 +5,7 @@ import argparse
 import cv2
 import os
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2'
 
 matplotlib.use('Agg')  # suppress plot showing
 import utils.py
@@ -38,7 +38,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 device = 'cuda'
-device_ids = [0, 1, 2, 3]
+device_ids = [0, 1, 2]
 patch_size = 8
 random.seed(125)
 np.random.seed(125)
@@ -71,10 +71,10 @@ num_band = 64
 k = 50      # visualize top k supporters
 feature_sample_step = 1
 
-log_dir = 'supporter_logs'
-video_name = "cache_len_100.mp4"    # using cache=15 !!!
-model_name_suffix = 'cache_len_100'
-ckpt_dir = 'checkpoints'
+log_dir = 'test_logs'
+video_name = "test.mp4"    # using cache=15 !!!
+model_name_suffix = 'test'
+ckpt_dir = 'checkpoints_test'
 
 # model_path = 'checkpoints_test/01_8_257_5e-4_p1_traj_estimation_00:16:31_test.pth'  # where the ckpt is
 use_ckpt = False
@@ -273,56 +273,32 @@ def run_model(model, sample, criterion, sw):
     w0 = pred[:, :, 4:5]  # M, 1, 1  weight for vote that begins at start point
     w1 = pred[:, :, 5:6]
 
-    # make sure that w are normalized inside the same timestep
-    # generate prediction
-    vote_matrix = torch.concat([dx0, dy0, dt, dx1, dy1, dt], dim=-1)    # M, 1, 6
+    # make sure that w are normalized inside the same timestep, generate prediction
+
+    start_vote_matrix = torch.concat([dx0, dy0, dt], dim=-1)    # M, 1, 3
+    end_vote_matrix = torch.concat([dx1, dy1, dt], dim=-1)
+
     pred_traj = torch.zeros(B, S, 2).cuda().float()
 
     frame_lst = []  # for visualization
 
     # separate trajs that belongs to different time step
-    # print supporters to check its validity
     for i in range(S):
 
-        if i == 0:
-            # supporters are points with x, y,t
-            supporters = short_traj[:traj_num_lst[0], :, :3]    # m, 1, 3 (first 3 )
-            votes = vote_matrix[:traj_num_lst[0], :, :3]
-            w = w0[:traj_num_lst[0]]
+        idx_start = start_loc[:, :, -1] == i
+        idx_end = end_loc[:, :, -1] == i
 
-        elif i == S-1:
-            end_at_frame_i = sum(traj_num_lst[:-1])
-            supporters = short_traj[end_at_frame_i:, :, 3:6]
-            votes = vote_matrix[end_at_frame_i:, :, 3:6]
-            w = w1[end_at_frame_i:]
+        supporters_start_loc = start_loc[idx_start]
+        supporters_end_loc = end_loc[idx_end]
+        supporters = torch.concat([supporters_start_loc, supporters_end_loc], dim=0)
 
-        else:
-            start_at_frame_i = sum(traj_num_lst[:i])    # trajs that has timestep (i, i+1)
-            end_at_frame_i = sum(traj_num_lst[:i-1])    # trajs that has timestep (i-1, i)
-
-            '''
-            pts_from_start_loc: points that is the start of a trajectory & belong to frame i
-            pts_from_end_loc: points that is the end of a trajectory & belong to frame i
-            
-            a single frame contains points from two part: start point & end point of trajs
-            '''
-
-            pts_from_start_loc = short_traj[start_at_frame_i: start_at_frame_i + traj_num_lst[i], :, :3]
-            pts_from_end_loc = short_traj[end_at_frame_i:end_at_frame_i + traj_num_lst[i-1], :, 3:6]
-
-            supporters = torch.concat([pts_from_start_loc, pts_from_end_loc], axis=0)
-
-            votes = torch.concat([vote_matrix[start_at_frame_i: start_at_frame_i + traj_num_lst[i], :, :3],
-                                  vote_matrix[end_at_frame_i:end_at_frame_i + traj_num_lst[i-1], :, 3:6]], axis=0)
-            w = torch.concat([w0[start_at_frame_i: start_at_frame_i + traj_num_lst[i]],
-                              w1[end_at_frame_i:end_at_frame_i + traj_num_lst[i-1]]], axis=0)
-
-        # print(i)
-        # print(supporters)     # results should have same timestep
+        votes = torch.concat([start_vote_matrix[idx_start], end_vote_matrix[idx_end]], dim=0)
+        w = torch.concat([w0[idx_start], w1[idx_end]], dim=0)
 
         vote_pts = supporters + votes
         norm_w = torch.softmax(w, dim=0)
-        pred_traj[:, i] = torch.sum(norm_w * vote_pts, dim=0)[:, 0:2]
+
+        pred_traj[:, i] = torch.sum(norm_w * vote_pts, dim=0)[0:2]
 
         if sw is not None and sw.save_this:
             try:
