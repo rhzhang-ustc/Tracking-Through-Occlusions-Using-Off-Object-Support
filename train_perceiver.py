@@ -52,7 +52,7 @@ grad_acc = 1
 
 crop_size = (368, 496)
 
-max_iters = 10000
+max_iters = 30000
 log_freq = 1000
 save_freq = 5000
 shuffle = False
@@ -71,10 +71,10 @@ num_band = 64
 k = 50      # visualize top k supporters
 feature_sample_step = 1
 
-log_dir = 'test_logs'
-video_name = "test.mp4"    # using cache=15 !!!
-model_name_suffix = 'test'
-ckpt_dir = 'checkpoints_test'
+log_dir = 'supporter_logs'
+video_name = "cache_len_1.mp4"    # using cache=15 !!!
+model_name_suffix = 'cache_len_1'
+ckpt_dir = 'checkpoints'
 
 # model_path = 'checkpoints_test/01_8_257_5e-4_p1_traj_estimation_00:16:31_test.pth'  # where the ckpt is
 use_ckpt = False
@@ -121,8 +121,8 @@ def draw_arrows(frame, supporters, votes, groundtruth, pred, order=False):
         # cv2.rectangle(frame, (start_pt[0] - 2, start_pt[1] - 2), (start_pt[0] + 2, start_pt[1] + 2), (0, 0, 255))
         cv2.rectangle(frame, (end_pt[0] - 1, end_pt[1] - 1), (end_pt[0] + 1, end_pt[1] + 1), (255, 0, 0))
 
-    cv2.circle(frame, (int(groundtruth[0]), int(groundtruth[1])), 4, (0, 0, 255))
-    cv2.circle(frame, (int(pred[0]), int(pred[1])), 4, (255, 0, 0))
+    cv2.circle(frame, (int(groundtruth[0]), int(groundtruth[1])), 4, (0, 0, 255), thickness=-1)
+    cv2.circle(frame, (int(pred[0]), int(pred[1])), 4, (255, 0, 0), thickness=-1)
 
     return frame
 
@@ -175,8 +175,7 @@ def run_model(model, sample, criterion, sw):
     _, _, N, _ = trajs.shape
 
     '''
-    generate target: one trajectory that needs to be estimate
-    then delete the point from trajs
+    generate target: one trajectory that needs to be estimate, then delete the point from trajs
     '''
     target_traj = trajs[:, :, 0:1, :]   # B, S, 1, 2
     start_target_traj = target_traj[:, 0:1, :, :]   # B, 1, 1, 2
@@ -199,12 +198,10 @@ def run_model(model, sample, criterion, sw):
     end_loc = relative_pos[:, 1:, :, :].reshape(B, -1, 3)
 
     # parameter M indicate the number of trajs
-    short_traj = torch.concat([start_loc, end_loc], axis=-1)  # B, (S-1)*(N-1), 6
-
-    true_traj_mask = (0 < short_traj[:, :, 0]) & (short_traj[:, :, 0] < W-1) \
-                     & (0 < short_traj[:, :, 3]) & (short_traj[:, :, 3] < W - 1) \
-                     & (0 < short_traj[:, :, 1]) & (short_traj[:, :, 1] < H - 1) \
-                     & (0 < short_traj[:, :, 4]) & (short_traj[:, :, 4] < H - 1)
+    true_traj_mask = (0 < start_loc[:, :, 0]) & (start_loc[:, :, 0] < W-1) \
+                     & (0 < end_loc[:, :, 0]) & (end_loc[:, :, 0] < W - 1) \
+                     & (0 < start_loc[:, :, 1]) & (start_loc[:, :, 1] < H - 1) \
+                     & (0 < end_loc[:, :, 1]) & (end_loc[:, :, 1] < H - 1)
 
     true_traj_mask = true_traj_mask.unsqueeze(-1)   # 1, M, 1
     M = int(true_traj_mask.sum())
@@ -216,17 +213,8 @@ def run_model(model, sample, criterion, sw):
     '''
     filter the data
     '''
-    short_traj = torch.masked_select(short_traj, true_traj_mask.repeat(1, 1, 6))
-    short_traj = short_traj.reshape(M, B, -1)  # M, 1, 6
-
     start_loc = torch.masked_select(start_loc, true_traj_mask.repeat(1, 1, 3)).reshape(M, B, -1)  # M, 1, 3
     end_loc = torch.masked_select(end_loc, true_traj_mask.repeat(1, 1, 3)).reshape(M, B, -1)
-
-    # static: where is the split point that separate different time step
-    traj_num_lst = []
-    for i in range(S-1):
-        num_in_frame_i = len([item for item in short_traj if item[0, 2] == i])  # number of trajs that start at frame i
-        traj_num_lst.append(num_in_frame_i)
 
     '''
     3d position encoding
@@ -290,7 +278,7 @@ def run_model(model, sample, criterion, sw):
 
         supporters_start_loc = start_loc[idx_start]
         supporters_end_loc = end_loc[idx_end]
-        supporters = torch.concat([supporters_start_loc, supporters_end_loc], dim=0)
+        supporters = torch.concat([supporters_start_loc, supporters_end_loc], dim=0)    # M, 3
 
         votes = torch.concat([start_vote_matrix[idx_start], end_vote_matrix[idx_end]], dim=0)
         w = torch.concat([w0[idx_start], w1[idx_end]], dim=0)
@@ -300,22 +288,34 @@ def run_model(model, sample, criterion, sw):
 
         pred_traj[:, i] = torch.sum(norm_w * vote_pts, dim=0)[0:2]
 
+        '''
+        force the first frame to has the right prediction (all point to the start point)
+        dx, dy at the first frame should be right
+        '''
+        if i == 0:
+            start_target_traj = start_target_traj[:, 0, 0, :]   # 1, 2
+            ground_vote_matrix = start_target_traj - supporters[:, :2]   # M, 2
+            total_loss += criterion(ground_vote_matrix, votes[:, :2])
+
+        '''
+        visualization
+        '''
         if sw is not None and sw.save_this:
             try:
-                _, top_k_index = torch.topk(norm_w, k, dim=0)  # M, 1, 1
+                _, top_k_index = torch.topk(norm_w, k, dim=0)  # M, 1
             except Exception:
                 k_temp = len(norm_w)
-                _, top_k_index = torch.topk(norm_w, k_temp, dim=0)  # M
+                _, top_k_index = torch.topk(norm_w, k_temp, dim=0)
 
-            k_supporter = supporters.index_select(0, top_k_index[:, 0, 0])  # M, 1, 3
-            k_votes = votes.index_select(0, top_k_index[:, 0, 0])  # M ,1, 3
+            k_supporter = supporters.index_select(0, top_k_index[:, 0])  # M, 3
+            k_votes = votes.index_select(0, top_k_index[:, 0])  # M , 3
 
             frame = rgbs[0, i].transpose(0, 2).transpose(0, 1).cpu()
             frame = np.array(frame)[:, :, ::-1]
             frame = np.ascontiguousarray(frame, dtype=np.int32)    # H, W, C
 
-            frame_drawn = draw_arrows(frame, k_supporter[:, 0, :].cpu().detach(),
-                                      k_votes[:, 0, :].cpu().detach(),
+            frame_drawn = draw_arrows(frame, k_supporter.cpu().detach(),
+                                      k_votes.cpu().detach(),
                                       target_traj[0, i, 0],
                                       pred_traj[0, i],
                                       order=False)
@@ -323,7 +323,9 @@ def run_model(model, sample, criterion, sw):
             frame_lst.append(np.array(frame_drawn, dtype=np.uint8))
 
     pred_traj = pred_traj.reshape(B, S, 1, -1)     # B, S, 1, 2
-    total_loss = criterion(target_traj, pred_traj)
+    total_loss += criterion(target_traj, pred_traj)
+
+
 
     if sw is not None and sw.save_this:
 
