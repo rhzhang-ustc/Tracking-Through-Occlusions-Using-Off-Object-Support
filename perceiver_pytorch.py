@@ -265,14 +265,18 @@ class Perceiver(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, input_dim, output_dim, latent_dim=1024):
+    def __init__(self, in_dim, out_dim, hidden_dim=1024):
 
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, latent_dim),
-            nn.ReLU(),
-            nn.Linear(latent_dim, output_dim)
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_dim, out_dim),
         )
 
     def forward(self, x):
-        return self.mlp(x)
+        return self.net(x)
