@@ -6,7 +6,7 @@
 #SBATCH --mem=64G
 
 # only use the following on partition with GPUs
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:3
 
 #SBATCH --job-name="train_estimation_perceiver"
 #SBATCH --output=perceiver_estimation-%j.out
@@ -23,7 +23,7 @@ echo "SLURMTMPDIR="$SLURMTMPDIR
 echo "working directory = "$SLURM_SUBMIT_DIR
 
 # process
-python3 train_perceiver.py --max_iters 200000 --cache_len 80 --use_cache True
+python3 train_mlp.py --max_iters 200000 --cache_len 1000 --use_cache True
 
 # can try the following to list out which GPU you have access to
 # srun /usr/local/cuda/samples/1_Utilities/deviceQuery/deviceQuery

@@ -36,6 +36,8 @@ from perceiver_pytorch import Perceiver
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+import inspect
+from gpu_mem_track import MemTracker
 
 device = 'cuda'
 device_ids = [0, 1, 2]
@@ -46,14 +48,14 @@ np.random.seed(125)
 ## choose hyps
 B = 1
 S = 8
-N = 128 +1 # we need to load at least 4 i think
+N = 256 +1 # we need to load at least 4 i think
 lr = 1e-5
 grad_acc = 1
 
 crop_size = (368, 496)
 
 max_iters = 10000
-log_freq = 100
+log_freq = 1000
 save_freq = 5000
 shuffle = False
 do_val = False
@@ -455,52 +457,27 @@ def train():
 
     scaler = torch.cuda.amp.GradScaler()
 
-    def trace_handler(p):
-        output = p.key_averages().table(sort_by="self_cuda_time_total", row_limit=6)
-        print(output)
+    while global_step < max_iters:
 
-    with torch.profiler.profile(
-            schedule=torch.profiler.schedule(
-                wait=2,
-                warmup=2,
-                active=6,
-                repeat=1),
-            on_trace_ready=trace_handler,
-            with_stack=True
-    ) as profiler:
+        model = model.train()
 
-        while global_step < max_iters:
+        read_start_time = time.time()
+        global_step += 1
 
-            model = model.train()
+        sw_t = utils.improc.Summ_writer(
+            writer=writer_t,
+            global_step=global_step,
+            log_freq=log_freq,
+            fps=5,
+            scalar_freq=2,
+            just_gif=True)
 
-            read_start_time = time.time()
-            global_step += 1
+        if cache:
+            if (global_step) % cache_freq == 0:
+                sample_pool.empty()
 
-            sw_t = utils.improc.Summ_writer(
-                writer=writer_t,
-                global_step=global_step,
-                log_freq=log_freq,
-                fps=5,
-                scalar_freq=2,
-                just_gif=True)
-
-            if cache:
-                if (global_step) % cache_freq == 0:
-                    sample_pool.empty()
-
-                if len(sample_pool) < cache_len:
-                    print('caching a new sample')
-                    try:
-                        sample = next(train_iterloader)
-                    except StopIteration:
-                        train_iterloader = iter(train_dataloader)
-                        sample = next(train_iterloader)
-                    sample['rgbs'] = sample['rgbs'].cpu().detach().numpy()
-                    sample['masks'] = sample['masks'].cpu().detach().numpy()
-                    sample_pool.update([sample])
-                else:
-                    sample = sample_pool.sample()
-            else:
+            if len(sample_pool) < cache_len:
+                print('caching a new sample')
                 try:
                     sample = next(train_iterloader)
                 except StopIteration:
@@ -508,60 +485,69 @@ def train():
                     sample = next(train_iterloader)
                 sample['rgbs'] = sample['rgbs'].cpu().detach().numpy()
                 sample['masks'] = sample['masks'].cpu().detach().numpy()
+                sample_pool.update([sample])
+            else:
+                sample = sample_pool.sample()
+        else:
+            try:
+                sample = next(train_iterloader)
+            except StopIteration:
+                train_iterloader = iter(train_dataloader)
+                sample = next(train_iterloader)
+            sample['rgbs'] = sample['rgbs'].cpu().detach().numpy()
+            sample['masks'] = sample['masks'].cpu().detach().numpy()
 
-            read_time = time.time() - read_start_time
-            iter_start_time = time.time()
+        read_time = time.time() - read_start_time
+        iter_start_time = time.time()
 
-            optimizer.zero_grad()
-            with torch.cuda.amp.autocast():
-                total_loss = run_model(model, sample, criterion, sw_t)
+        optimizer.zero_grad()
+        with torch.cuda.amp.autocast():
+            total_loss = run_model(model, sample, criterion, sw_t)
 
-            scaler.scale(total_loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+        scaler.scale(total_loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
-            profiler.step()
+        sw_t.summ_scalar('total_loss', total_loss)
+        loss_pool_t.update([total_loss.detach().cpu().numpy()])
+        sw_t.summ_scalar('pooled/total_loss', loss_pool_t.mean())
 
-            sw_t.summ_scalar('total_loss', total_loss)
-            loss_pool_t.update([total_loss.detach().cpu().numpy()])
-            sw_t.summ_scalar('pooled/total_loss', loss_pool_t.mean())
+        if do_val and (global_step) % val_freq == 0:
+            torch.cuda.empty_cache()
+            # let's do a val iter
+            model.eval()
+            sw_v = utils.improc.Summ_writer(
+                writer=writer_v,
+                global_step=global_step,
+                log_freq=log_freq,
+                fps=5,
+                scalar_freq=2,
+                just_gif=True)
+            try:
+                sample = next(val_iterloader)
+            except StopIteration:
+                val_iterloader = iter(val_dataloader)
+                sample = next(val_iterloader)
+            sample['rgbs'] = sample['rgbs'].cpu().detach().numpy()
+            sample['masks'] = sample['masks'].cpu().detach().numpy()
 
-            if do_val and (global_step) % val_freq == 0:
-                torch.cuda.empty_cache()
-                # let's do a val iter
-                model.eval()
-                sw_v = utils.improc.Summ_writer(
-                    writer=writer_v,
-                    global_step=global_step,
-                    log_freq=log_freq,
-                    fps=5,
-                    scalar_freq=2,
-                    just_gif=True)
-                try:
-                    sample = next(val_iterloader)
-                except StopIteration:
-                    val_iterloader = iter(val_dataloader)
-                    sample = next(val_iterloader)
-                sample['rgbs'] = sample['rgbs'].cpu().detach().numpy()
-                sample['masks'] = sample['masks'].cpu().detach().numpy()
+            with torch.no_grad():
+                total_loss = run_model(model, sample, criterion, optimizer)
+            sw_v.summ_scalar('total_loss', total_loss)
+            loss_pool_v.update([total_loss.detach().cpu().numpy()])
+            sw_v.summ_scalar('pooled/total_loss', loss_pool_v.mean())
 
-                with torch.no_grad():
-                    total_loss = run_model(model, sample, criterion, optimizer)
-                sw_v.summ_scalar('total_loss', total_loss)
-                loss_pool_v.update([total_loss.detach().cpu().numpy()])
-                sw_v.summ_scalar('pooled/total_loss', loss_pool_v.mean())
+        iter_time = time.time() - iter_start_time
+        print('%s; step %06d/%d; rtime %.2f; itime %.2f; loss = %.5f' % (
+            model_name, global_step, max_iters, read_time, iter_time,
+            total_loss.item()))
 
-            iter_time = time.time() - iter_start_time
-            print('%s; step %06d/%d; rtime %.2f; itime %.2f; loss = %.5f' % (
-                model_name, global_step, max_iters, read_time, iter_time,
-                total_loss.item()))
+        if not global_step % save_freq:
+            torch.save(model.state_dict(), ckpt_path)
 
-            if not global_step % save_freq:
-                torch.save(model.state_dict(), ckpt_path)
-
-        writer_t.close()
-        if do_val:
-            writer_v.close()
+    writer_t.close()
+    if do_val:
+        writer_v.close()
 
 
 if __name__ == '__main__':

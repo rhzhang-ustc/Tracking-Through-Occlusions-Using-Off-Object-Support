@@ -5,7 +5,7 @@ import argparse
 import cv2
 import os
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2'
 
 matplotlib.use('Agg')  # suppress plot showing
 import utils.py
@@ -38,7 +38,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 device = 'cuda'
-device_ids = [0, 1]
+device_ids = [0, 1, 2]
 patch_size = 8
 random.seed(125)
 np.random.seed(125)
