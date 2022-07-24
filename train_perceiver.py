@@ -37,7 +37,6 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 import inspect
-from gpu_mem_track import MemTracker
 
 device = 'cuda'
 device_ids = [0, 1, 2]
@@ -48,14 +47,14 @@ np.random.seed(125)
 ## choose hyps
 B = 1
 S = 8
-N = 256 +1 # we need to load at least 4 i think
+N = 1024 +1 # we need to load at least 4 i think
 lr = 1e-5
 grad_acc = 1
 
 crop_size = (368, 496)
 
 max_iters = 10000
-log_freq = 1000
+log_freq = 10
 save_freq = 5000
 shuffle = False
 do_val = False
@@ -72,12 +71,14 @@ queries_dim = 27 + 2
 dim = 3
 feature_dim = 27
 num_band = 64
-k = 10      # visualize top k supporters
+k_vis = 100      # visualize top k supporters
+k=10    # number of supporters that recieve loss
 feature_sample_step = 1
+vis_threshold = 0.1
 
 log_dir = 'test_logs'
-video_name = "test.mp4"
-model_name_suffix = 'test'
+video_name = "cache_len_1.mp4"
+model_name_suffix = 'cache_len_1'
 ckpt_dir = 'checkpoints_test'
 
 # model_path = 'checkpoints/01_8_257_1e-4_p1_traj_estimation_00:52:54_cache_len_15.pth'  # where the ckpt is
@@ -97,7 +98,7 @@ def write_result(frame_lst, output_path, colored):
     video.release()
 
 
-def draw_arrows(frame, supporters, votes, groundtruth, pred, order=False):
+def draw_arrows(frame, supporters, votes, weights, vis_thres, groundtruth, pred, order=False):
     # order: draw arrow & suggest its weights
     # N, 3: supporters / votes
     # 1, 2: groundtruth /pred
@@ -110,6 +111,9 @@ def draw_arrows(frame, supporters, votes, groundtruth, pred, order=False):
     frame = (frame_gray + frame)/2
 
     for idx in range(k):
+        w = weights[idx]
+        if w < vis_thres:
+            continue
         pt = supporters[idx]
         dxy = votes[idx]
 
@@ -304,7 +308,7 @@ def run_model(model, sample, criterion, sw):
         additional loss: force topk points to have reasonable result
         '''
         try:
-            k_temp = k
+            k_temp = k_vis
             _, top_k_index = torch.topk(norm_w, k_temp, dim=0)  # M, 1
         except Exception:
             k_temp = len(norm_w)
@@ -312,9 +316,16 @@ def run_model(model, sample, criterion, sw):
 
         k_supporter = supporters.index_select(0, top_k_index[:, 0])  # M, 3
         k_votes = votes.index_select(0, top_k_index[:, 0])  # M , 3
+        k_w = w.index_select(0, top_k_index[:, 0])
 
         pred_matrix = (k_supporter + k_votes)[:, 0:2]
-        total_loss = total_loss + criterion(pred_matrix, target_traj_i.repeat(k_temp, 1))
+
+        if k > k_temp:
+            k_i = k_temp  # number of supporters that recieve loss
+        else:
+            k_i = k
+
+        total_loss = total_loss + criterion(pred_matrix[:k_i], target_traj_i.repeat(k_i, 1))  # loss for k
 
         '''
         visualization
@@ -326,6 +337,8 @@ def run_model(model, sample, criterion, sw):
 
             frame_drawn = draw_arrows(frame, k_supporter.cpu().detach(),
                                       k_votes.cpu().detach(),
+                                      k_w.cpu().detach(),
+                                      vis_threshold,
                                       target_traj_i[0],
                                       pred_traj_i[0],
                                       order=False)
@@ -566,6 +579,5 @@ if __name__ == '__main__':
     cache = args.use_cache
     max_iters = args.max_iters
     cache_len = args.cache_len
-
 
     train()
