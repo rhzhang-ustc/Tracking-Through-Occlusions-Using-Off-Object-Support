@@ -5,7 +5,7 @@ import argparse
 import cv2
 import os
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 matplotlib.use('Agg')  # suppress plot showing
 import utils.py
@@ -38,7 +38,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 device = 'cuda'
-device_ids = [0, 1, 2]
+device_ids = [0]
 patch_size = 8
 random.seed(125)
 np.random.seed(125)
@@ -46,14 +46,14 @@ np.random.seed(125)
 ## choose hyps
 B = 1
 S = 8
-N = 2048 +1 # we need to load at least 4 i think
-lr = 1e-5
+N = 56 +1 # we need to load at least 4 i think
+lr = 1e-4
 grad_acc = 1
 
 crop_size = (368, 496)
 
 max_iters = 10000
-log_freq = 100
+log_freq = 1000
 save_freq = 5000
 shuffle = False
 do_val = False
@@ -71,30 +71,17 @@ dim = 3
 feature_dim = 27
 num_band = 64
 k = 10   # supervision
-k_vis = 100 #visualize
+k_vis = 100  # visualize
 feature_sample_step = 1
 vis_threshold = 0.1
 
 log_dir = 'supporter_logs'
-video_name = "mlp.mp4"
-model_name_suffix = 'mlp'
+model_name_suffix = 'cache_len_100'
 ckpt_dir = 'checkpoints'
+num_worker = 12
 
-# model_path = 'checkpoints/01_8_257_1e-4_p1_traj_estimation_00:52:54_cache_len_15.pth'  # where the ckpt is
+#model_path = 'checkpoints/01_8_2049_1e-5_p1_traj_estimation_05:46:30_cache_len_100_continue.pth'  # where the ckpt is
 use_ckpt = False
-
-
-def write_result(frame_lst, output_path, colored):
-
-    frame_shape = frame_lst[0].shape
-    video_size = (frame_shape[1], frame_shape[0])
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    video = cv2.VideoWriter(output_path, fourcc, 30, video_size, colored)
-
-    for frame in frame_lst:
-        video.write(frame)
-
-    video.release()
 
 
 def draw_arrows(frame, supporters, votes, weights, vis_thres, groundtruth, pred, order=False):
@@ -154,6 +141,7 @@ def extract_frame_patches(frames, trajs, step=feature_sample_step):
     grid_y = y_range.repeat(1, 1, 1, 3, 1).flatten(start_dim=-2)
 
     # bilinear sample, B, S, N, C, 9
+    # CNN from pips basic encoder
     output = torch.zeros((B, S, N, C, 9))
     for s in range(S):
         for i in range(3):
@@ -215,7 +203,7 @@ def run_model(model, sample, criterion, sw):
 
     if M <= 0:
         print('false data')
-        return total_loss
+        return total_loss, (None, None, None, None)
 
     '''
     filter the data
@@ -243,6 +231,9 @@ def run_model(model, sample, criterion, sw):
     '''
     relative motion
     '''
+
+    # encode this ! 32 for both
+
     target_motion = (target_traj[:, 1:2, :, :] - start_target_traj)[0]   # 1, 1, 2
     target_motion = torch.concat([target_motion, torch.ones(1, 1, 1).cuda().float()], dim=-1)  # 1, 1, 3
     motion = end_loc - start_loc    # M, 1, 3
@@ -251,6 +242,8 @@ def run_model(model, sample, criterion, sw):
     '''
     use perceiver model instead of perceiver io
     '''
+
+    # target feature
     input_matrix = torch.concat([short_trajs_encoding, short_trajs_features, relative_motion], axis=-1)  # M, 1, 447
     input_matrix = input_matrix.to(device)
 
@@ -278,7 +271,15 @@ def run_model(model, sample, criterion, sw):
     pred_traj = torch.zeros(B, S, 1, 2)
 
     # separate trajs that belongs to different time step
+
+    frac_supporters_01 = 0
+    frac_supporters_005 = 0
+    frac_supporters_001 = 0
+    supporter_num = 0
+
     for i in range(S):
+
+        # new way !
 
         idx_start = start_loc[:, :, -1] == i
         idx_end = end_loc[:, :, -1] == i
@@ -288,7 +289,7 @@ def run_model(model, sample, criterion, sw):
 
         supporters_start_loc = start_loc[idx_start]
         supporters_end_loc = end_loc[idx_end]
-        supporters = torch.concat([supporters_start_loc, supporters_end_loc], dim=0)    # M, 3
+        supporters = torch.concat([supporters_start_loc, supporters_end_loc], dim=0)    # M, 2, 3
 
         votes = torch.concat([start_vote_matrix[idx_start], end_vote_matrix[idx_end]], dim=0)
         w = torch.concat([w0[idx_start], w1[idx_end]], dim=0)
@@ -315,16 +316,22 @@ def run_model(model, sample, criterion, sw):
 
         k_supporter = supporters.index_select(0, top_k_index[:, 0])  # k_vis, 3
         k_votes = votes.index_select(0, top_k_index[:, 0])  # k_vis , 3
-        k_w = w.index_select(0, top_k_index[:, 0])
+        k_w = norm_w.index_select(0, top_k_index[:, 0])
 
         pred_matrix = (k_supporter + k_votes)[:, 0:2]
 
+        # more easy way
         if k > k_temp:
             k_i = k_temp    # number of supporters that recieve loss
         else:
             k_i = k
 
         total_loss = total_loss + criterion(pred_matrix[:k_i], target_traj_i.repeat(k_i, 1))  # loss for k
+
+        frac_supporters_01 += torch.sum(norm_w > 0.1)
+        frac_supporters_005 += torch.sum(norm_w > 0.05)
+        frac_supporters_001 += torch.sum(norm_w > 0.01)
+        supporter_num += len(norm_w)
 
         '''
         visualization
@@ -342,7 +349,8 @@ def run_model(model, sample, criterion, sw):
                                       pred_traj_i[0],
                                       order=False)
 
-            frame_lst.append(np.array(frame_drawn, dtype=np.uint8))
+            frame_drawn = torch.from_numpy(frame_drawn).transpose(0, 1).transpose(0, 2).byte()   # C, H, W
+            frame_lst.append(frame_drawn)
 
     if sw is not None and sw.save_this:
 
@@ -356,10 +364,11 @@ def run_model(model, sample, criterion, sw):
         sw.summ_traj2ds_on_rgb('outputs/single_trajs_on_gt_black', pred_traj[0:1], gt_black[0:1], cmap='spring')
 
         sw.summ_rgbs('inputs_0/rgbs', utils.improc.preprocess_color(rgbs[0:1]).unbind(1))
-        if len(frame_lst):
-            write_result(frame_lst, video_name, True)
 
-    return total_loss/S
+        frames = torch.stack(frame_lst, dim=0).unsqueeze(1)  # 8, 1, C, H, W
+        sw.summ_rgbs('outputs/votes_on_rgb', tuple(frames))
+
+    return total_loss/S, (frac_supporters_01, frac_supporters_005, frac_supporters_001, supporter_num)
 
 
 def train():
@@ -414,7 +423,7 @@ def train():
         train_dataset,
         batch_size=B,
         shuffle=shuffle,
-        num_workers=0,
+        num_workers=num_worker,
         worker_init_fn=worker_init_fn,
         drop_last=True)
     train_iterloader = iter(train_dataloader)
@@ -439,6 +448,10 @@ def train():
 
     n_pool = 100
     loss_pool_t = utils.misc.SimplePool(n_pool, version='np')
+    frac_01_pool_t = utils.misc.SimplePool(n_pool, version='np')
+    frac_005_pool_t = utils.misc.SimplePool(n_pool, version='np')
+    frac_001_pool_t = utils.misc.SimplePool(n_pool, version='np')
+
     if do_val:
         loss_pool_v = utils.misc.SimplePool(n_pool, version='np')
 
@@ -467,10 +480,7 @@ def train():
         model.load_state_dict(state, strict=False)
 
     criterion = nn.L1Loss()
-    # optimizer = optim.SGD(model.parameters(), lr=lr)
     optimizer = optim.AdamW(model.parameters(), lr=lr)
-
-    scaler = torch.cuda.amp.GradScaler()
 
     while global_step < max_iters:
 
@@ -516,16 +526,34 @@ def train():
         iter_start_time = time.time()
 
         optimizer.zero_grad()
-        with torch.cuda.amp.autocast():
-            total_loss = run_model(model, sample, criterion, sw_t)
 
-        scaler.scale(total_loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        total_loss, frac_supporters_scaler = run_model(model, sample, criterion, sw_t)
+
+        total_loss.backward()
+        optimizer.step()
 
         sw_t.summ_scalar('total_loss', total_loss)
         loss_pool_t.update([total_loss.detach().cpu().numpy()])
         sw_t.summ_scalar('pooled/total_loss', loss_pool_t.mean())
+
+        '''
+        fraction of supporters: visualization
+        '''
+        frac_supporters_01 = frac_supporters_scaler[0]
+        if frac_supporters_01 is None:
+            continue
+
+        frac_supporters_005 = frac_supporters_scaler[1]
+        frac_supporters_001 = frac_supporters_scaler[2]
+        supporter_num = frac_supporters_scaler[3]
+
+        frac_01_pool_t.update([float(frac_supporters_01 / supporter_num)])
+        frac_005_pool_t.update([float(frac_supporters_005 / supporter_num)])
+        frac_001_pool_t.update([float(frac_supporters_001 / supporter_num)])
+
+        sw_t.summ_scalar('outputs/frac_of_supporters/thres=0.1', frac_01_pool_t.mean())
+        sw_t.summ_scalar('outputs/frac_of_supporters/thres=0.05', frac_005_pool_t.mean())
+        sw_t.summ_scalar('outputs/frac_of_supporters/thres=0.01', frac_001_pool_t.mean())
 
         if do_val and (global_step) % val_freq == 0:
             torch.cuda.empty_cache()
@@ -574,7 +602,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_cache', type=bool, help='whether to use cache in training;',
                         default=True)
     parser.add_argument('--cache_len', type=int, help='cache len',
-                        default=1)
+                        default=100)
 
     args = parser.parse_args()
 
