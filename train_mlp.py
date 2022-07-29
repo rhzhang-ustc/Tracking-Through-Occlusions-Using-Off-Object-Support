@@ -16,26 +16,18 @@ import utils.samp
 import utils.basic
 import random
 
-from utils.basic import print_, print_stats
-
 # import datasets
 import flyingthingsdataset
 
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 import torch.optim as optim
 
 from tensorboardX import SummaryWriter
 
-import torch.nn.functional as F
-
-from perceiver_io import PerceiverIO
-from perceiver_pytorch import Perceiver, MLP
-
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-
+from net.perceiver_pytorch import MLP
+from net.pips import BasicEncoder
 
 device = 'cuda'
 device_ids = [0]
@@ -46,14 +38,14 @@ np.random.seed(125)
 ## choose hyps
 B = 1
 S = 8
-N = 56 +1 # we need to load at least 4 i think
+N = 2048 +1 # we need to load at least 4 i think
 lr = 1e-4
 grad_acc = 1
 
 crop_size = (368, 496)
 
 max_iters = 10000
-log_freq = 1000
+log_freq = 10
 save_freq = 5000
 shuffle = False
 do_val = False
@@ -68,16 +60,18 @@ model_depth = 1
 
 queries_dim = 27 + 2
 dim = 3
-feature_dim = 27
-num_band = 64
+feature_map_dim = 128
+encoder_stride = 8
+
+num_band = 32
 k = 10   # supervision
 k_vis = 100  # visualize
 feature_sample_step = 1
 vis_threshold = 0.1
 
-log_dir = 'supporter_logs'
-model_name_suffix = 'cache_len_100'
-ckpt_dir = 'checkpoints'
+log_dir = 'test_logs'
+model_name_suffix = 'video_select'
+ckpt_dir = 'checkpoints_test'
 num_worker = 12
 
 #model_path = 'checkpoints/01_8_2049_1e-5_p1_traj_estimation_05:46:30_cache_len_100_continue.pth'  # where the ckpt is
@@ -121,44 +115,7 @@ def draw_arrows(frame, supporters, votes, weights, vis_thres, groundtruth, pred,
     return frame
 
 
-def extract_frame_patches(frames, trajs, step=feature_sample_step):
-    # steps: dilate conv style
-    # frames: (B, S, C, H, W)
-    # trajs: (B, S, N, 2)
-    # output: (B, S, N, feature_length) where feature are extracted according to (x, y)
-
-    _, _, C, H, W = frames.shape
-    B, S, N, _ = trajs.shape
-
-    # generate grid matrix for flow, B, S, N*9, 2
-    x = trajs[:, :, :, 0:1].clone().detach().int()  # B, S, N, 1
-    y = trajs[:, :, :, 1:].clone().detach().int()
-
-    x_range = torch.concat([x-step, x, x+step], axis=-1).unsqueeze(-1)  # B, S, N, 3, 1
-    y_range = torch.concat([y-step, y, y+step], axis=-1).unsqueeze(-2)  # B, S, N, 1, 3
-
-    grid_x = x_range.repeat(1, 1, 1, 1, 3).flatten(start_dim=-2)  # meshgrid, B, S, N, 9
-    grid_y = y_range.repeat(1, 1, 1, 3, 1).flatten(start_dim=-2)
-
-    # bilinear sample, B, S, N, C, 9
-    # CNN from pips basic encoder
-    output = torch.zeros((B, S, N, C, 9))
-    for s in range(S):
-        for i in range(3):
-            for j in range(3):
-                temp = utils.samp.bilinear_sample2d(frames[:, s],
-                                                    grid_x[:, s, :, i],
-                                                    grid_y[:, s, :, j])  # B, C, N
-
-                output[:, s, :, :, 3*i+j] = temp.transpose(1, 2)
-
-    # reshape, B, S, N, C*(2*step+1)*(2*step+1)
-    output = output.flatten(start_dim=-2)
-
-    return output
-
-
-def run_model(model, sample, criterion, sw):
+def run_model(model, encoder, sample, criterion, sw):
 
     total_loss = torch.tensor(0.0, requires_grad=True, device=device)
 
@@ -221,30 +178,46 @@ def run_model(model, sample, criterion, sw):
     '''
     frame patches
     '''
-    frame_features = extract_frame_patches(rgbs, trajs, step=1).cuda().float()  # B, S-1, N-1, 27
-    start_frame_features = frame_features[:, :-1, :, :]
-    end_frame_feature = frame_features[:, 1:, :, :]
+    frame_features_map = encoder(rgbs[0])  # 8, 128, 46, 62
 
-    short_trajs_features = torch.concat([start_frame_features, end_frame_feature], axis=-1).reshape(B, -1, 2*feature_dim)
-    short_trajs_features = torch.masked_select(short_trajs_features, true_traj_mask.repeat(1, 1, 2*feature_dim)).reshape(M, B, -1)
+    start_frame_features = torch.zeros(M, 1, feature_map_dim)
+    end_frame_features = torch.zeros(M, 1, feature_map_dim)
+
+    for i in range(M):
+        pt = start_loc[i]  # 1, 3
+        pt[:, 0] = torch.div(pt[0, 0], encoder_stride, rounding_mode='floor')
+        pt[:, 1] = torch.div(pt[0, 1], encoder_stride, rounding_mode='floor')
+        timestep = int(pt[0, -1])
+
+        start_frame_features[i] = utils.samp.bilinear_sample2d(frame_features_map[timestep:timestep+1, :],
+                                                               pt[:, 0:1], pt[:, 1:2]).squeeze(-1)
+
+        pt = end_loc[i]  # 1, 3
+        pt[:, 0] = torch.div(pt[0, 0], encoder_stride, rounding_mode='floor')
+        pt[:, 1] = torch.div(pt[0, 1], encoder_stride, rounding_mode='floor')
+        timestep = int(pt[0, -1])
+
+        end_frame_features[i] = utils.samp.bilinear_sample2d(frame_features_map[timestep:timestep + 1, :],
+                                                             pt[:, 0:1], pt[:, 1:2]).squeeze(-1)
+
+    short_trajs_features = torch.concat([start_frame_features, end_frame_features], dim=-1).cuda()  # M, 1, 128*2
 
     '''
     relative motion
     '''
-
-    # encode this ! 32 for both
-
     target_motion = (target_traj[:, 1:2, :, :] - start_target_traj)[0]   # 1, 1, 2
     target_motion = torch.concat([target_motion, torch.ones(1, 1, 1).cuda().float()], dim=-1)  # 1, 1, 3
     motion = end_loc - start_loc    # M, 1, 3
     relative_motion = motion - target_motion
+
+    relative_motion_encoding = utils.misc.get_3d_embedding(relative_motion, num_band)
 
     '''
     use perceiver model instead of perceiver io
     '''
 
     # target feature
-    input_matrix = torch.concat([short_trajs_encoding, short_trajs_features, relative_motion], axis=-1)  # M, 1, 447
+    input_matrix = torch.concat([short_trajs_encoding, short_trajs_features, relative_motion_encoding], axis=-1)   #  M, 1, 351
     input_matrix = input_matrix.to(device)
 
     pred = model(input_matrix)  # M, 6
@@ -279,8 +252,6 @@ def run_model(model, sample, criterion, sw):
 
     for i in range(S):
 
-        # new way !
-
         idx_start = start_loc[:, :, -1] == i
         idx_end = end_loc[:, :, -1] == i
 
@@ -289,7 +260,7 @@ def run_model(model, sample, criterion, sw):
 
         supporters_start_loc = start_loc[idx_start]
         supporters_end_loc = end_loc[idx_end]
-        supporters = torch.concat([supporters_start_loc, supporters_end_loc], dim=0)    # M, 2, 3
+        supporters = torch.concat([supporters_start_loc, supporters_end_loc], dim=0)    # M, 3
 
         votes = torch.concat([start_vote_matrix[idx_start], end_vote_matrix[idx_end]], dim=0)
         w = torch.concat([w0[idx_start], w1[idx_end]], dim=0)
@@ -471,16 +442,23 @@ def train():
                       final_classifier_head=True)
     '''
 
-    model = MLP(in_dim=2 * ((3*num_band+3) + feature_dim) + 3, out_dim=6)
+    model = MLP(in_dim=2 * ((3*num_band+3) + feature_map_dim) + (3*num_band + 3), out_dim=6)
     model = model.to(device)
     model = torch.nn.DataParallel(model, device_ids=device_ids)
+
+    encoder = BasicEncoder(input_dim=3, output_dim=feature_map_dim, stride=encoder_stride)
+    encoder = encoder.to(device)
+    encoder = torch.nn.DataParallel(encoder, device_ids=device_ids)
 
     if use_ckpt:
         state = torch.load(model_path)
         model.load_state_dict(state, strict=False)
 
     criterion = nn.L1Loss()
-    optimizer = optim.AdamW(model.parameters(), lr=lr)
+    optimizer = optim.AdamW([
+        {'params': model.parameters(), 'lr': lr},
+        {'params': encoder.parameters(), 'lr': lr}
+    ])
 
     while global_step < max_iters:
 
@@ -527,7 +505,7 @@ def train():
 
         optimizer.zero_grad()
 
-        total_loss, frac_supporters_scaler = run_model(model, sample, criterion, sw_t)
+        total_loss, frac_supporters_scaler = run_model(model, encoder, sample, criterion, sw_t)
 
         total_loss.backward()
         optimizer.step()
@@ -602,7 +580,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_cache', type=bool, help='whether to use cache in training;',
                         default=True)
     parser.add_argument('--cache_len', type=int, help='cache len',
-                        default=100)
+                        default=500)
 
     args = parser.parse_args()
 
