@@ -45,7 +45,7 @@ grad_acc = 1
 crop_size = (368, 496)
 
 max_iters = 10000
-log_freq = 10
+log_freq = 51
 save_freq = 5000
 shuffle = False
 do_val = False
@@ -70,7 +70,7 @@ feature_sample_step = 1
 vis_threshold = 0.1
 
 log_dir = 'test_logs'
-model_name_suffix = 'video_select'
+model_name_suffix = 'test'
 ckpt_dir = 'checkpoints_test'
 num_worker = 12
 
@@ -178,27 +178,12 @@ def run_model(model, encoder, sample, criterion, sw):
     '''
     frame patches
     '''
-    frame_features_map = encoder(rgbs[0])  # 8, 128, 46, 62
+    frame_features_map = encoder(rgbs[0])[None, :]  #1, 8, 128, 46, 62
 
-    start_frame_features = torch.zeros(M, 1, feature_map_dim)
-    end_frame_features = torch.zeros(M, 1, feature_map_dim)
-
-    for i in range(M):
-        pt = start_loc[i]  # 1, 3
-        pt[:, 0] = torch.div(pt[0, 0], encoder_stride, rounding_mode='floor')
-        pt[:, 1] = torch.div(pt[0, 1], encoder_stride, rounding_mode='floor')
-        timestep = int(pt[0, -1])
-
-        start_frame_features[i] = utils.samp.bilinear_sample2d(frame_features_map[timestep:timestep+1, :],
-                                                               pt[:, 0:1], pt[:, 1:2]).squeeze(-1)
-
-        pt = end_loc[i]  # 1, 3
-        pt[:, 0] = torch.div(pt[0, 0], encoder_stride, rounding_mode='floor')
-        pt[:, 1] = torch.div(pt[0, 1], encoder_stride, rounding_mode='floor')
-        timestep = int(pt[0, -1])
-
-        end_frame_features[i] = utils.samp.bilinear_sample2d(frame_features_map[timestep:timestep + 1, :],
-                                                             pt[:, 0:1], pt[:, 1:2]).squeeze(-1)
+    start_frame_features = utils.samp.trilinear_sample3d(frame_features_map.permute(0, 2, 1, 3, 4),
+                                                         start_loc.permute(1, 0, 2)).permute(2, 0, 1)
+    end_frame_features = utils.samp.trilinear_sample3d(frame_features_map.permute(0, 2, 1, 3, 4),
+                                                         end_loc.permute(1, 0, 2)).permute(2, 0, 1)
 
     short_trajs_features = torch.concat([start_frame_features, end_frame_features], dim=-1).cuda()  # M, 1, 128*2
 
@@ -576,12 +561,11 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--max_iters', type=int, help='iteration numbers',
-                        default=10000)
+                        default=20000)
     parser.add_argument('--use_cache', type=bool, help='whether to use cache in training;',
-                        default=True)
+                        default=False)
     parser.add_argument('--cache_len', type=int, help='cache len',
-                        default=500)
-
+                        default=100)
     args = parser.parse_args()
 
     cache = args.use_cache
