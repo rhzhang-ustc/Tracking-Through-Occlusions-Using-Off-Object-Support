@@ -39,7 +39,7 @@ np.random.seed(125)
 B = 1
 S = 8
 N = 2048 +1 # we need to load at least 4 i think
-lr = 1e-4
+lr = 1e-5
 grad_acc = 1
 
 crop_size = (368, 496)
@@ -67,15 +67,15 @@ num_band = 32
 k = 10   # supervision
 k_vis = 100  # visualize
 feature_sample_step = 1
-vis_threshold = 0.1
+vis_threshold = 0.05
 
 log_dir = 'supporter_logs'
-model_name_suffix = 'no_cache'
+model_name_suffix = 'full_version'
 ckpt_dir = 'checkpoints'
 num_worker = 12
 
-#model_path = 'checkpoints/01_8_2049_1e-5_p1_traj_estimation_05:46:30_cache_len_100_continue.pth'  # where the ckpt is
-use_ckpt = False
+model_path = 'checkpoints/01_8_2049_1e-4_p1_traj_estimation_23:51:35_full_version.pth'  # where the ckpt is
+use_ckpt = True
 
 
 def draw_arrows(frame, supporters, votes, weights, vis_thres, groundtruth, pred, order=False):
@@ -203,6 +203,15 @@ def run_model(model, encoder, sample, criterion, sw):
     short_trajs_features = torch.concat([start_frame_features, end_frame_features], dim=-1).cuda()  # M, 1, 128*2
 
     '''
+    target vector
+    '''
+
+    target_traj_feature = utils.samp.bilinear_sample2d(frame_features_map[:, 0, :],
+                                                       start_target_traj[:, 0, 0, 0:1] / encoder_stride,
+                                                       start_target_traj[:, 0, 0, 1:2] / encoder_stride)
+    target_traj_feature = target_traj_feature.permute(0, 2, 1)
+
+    '''
     relative motion
     '''
     target_motion = (target_traj[:, 1:2, :, :] - start_target_traj)[0]   # 1, 1, 2
@@ -217,7 +226,10 @@ def run_model(model, encoder, sample, criterion, sw):
     '''
 
     # target feature
-    input_matrix = torch.concat([short_trajs_encoding, short_trajs_features, relative_motion_encoding], axis=-1)   #  M, 1, 351
+    input_matrix = torch.concat([short_trajs_encoding,
+                                 short_trajs_features,
+                                 relative_motion_encoding,
+                                 target_traj_feature.repeat(M, 1, 1)], axis=-1)   #  M, 1, 681
     input_matrix = input_matrix.to(device)
 
     pred = model(input_matrix)  # M, 6
@@ -442,7 +454,7 @@ def train():
                       final_classifier_head=True)
     '''
 
-    model = MLP(in_dim=2 * ((3*num_band+3) + feature_map_dim) + (3*num_band + 3), out_dim=6)
+    model = MLP(in_dim=3 * ((3*num_band+3) + feature_map_dim), out_dim=6)
     model = model.to(device)
     model = torch.nn.DataParallel(model, device_ids=device_ids)
 
