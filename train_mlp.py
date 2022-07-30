@@ -45,7 +45,7 @@ grad_acc = 1
 crop_size = (368, 496)
 
 max_iters = 10000
-log_freq = 51
+log_freq = 1000
 save_freq = 5000
 shuffle = False
 do_val = False
@@ -69,9 +69,9 @@ k_vis = 100  # visualize
 feature_sample_step = 1
 vis_threshold = 0.1
 
-log_dir = 'test_logs'
-model_name_suffix = 'test'
-ckpt_dir = 'checkpoints_test'
+log_dir = 'supporter_logs'
+model_name_suffix = 'no_cache'
+ckpt_dir = 'checkpoints'
 num_worker = 12
 
 #model_path = 'checkpoints/01_8_2049_1e-5_p1_traj_estimation_05:46:30_cache_len_100_continue.pth'  # where the ckpt is
@@ -141,13 +141,17 @@ def run_model(model, encoder, sample, criterion, sw):
     t_pos = t_pos.transpose(1, 2)   # B, S, N-1, 1
 
     relative_pos = torch.concat([relative_traj, t_pos], axis=-1)  # B, S, N-1, 3
+    pos = torch.concat([trajs, t_pos], axis=-1)     # B, S, N-1, 3
 
     '''
     chop relative pos into short trajs:  B, S*(N-1), 3, 2
     where 3, 2 means x0, y0, t0, x1, y1, t1 (start & end point)
     '''
-    start_loc = relative_pos[:, :-1, :, :].reshape(B, -1, 3)  # B, (S-1)*(N-1), 3
-    end_loc = relative_pos[:, 1:, :, :].reshape(B, -1, 3)
+    start_loc = pos[:, :-1, :, :].reshape(B, -1, 3)  # B, (S-1)*(N-1), 3
+    end_loc = pos[:, 1:, :, :].reshape(B, -1, 3)
+
+    start_relative_loc = relative_pos[:, :-1, :, :].reshape(B, -1, 3)
+    end_relative_loc = relative_pos[:, 1:, :, :].reshape(B, -1, 3)
 
     # parameter M indicate the number of trajs
     true_traj_mask = (0 < start_loc[:, :, 0]) & (start_loc[:, :, 0] < W-1) \
@@ -168,22 +172,33 @@ def run_model(model, encoder, sample, criterion, sw):
     start_loc = torch.masked_select(start_loc, true_traj_mask.repeat(1, 1, 3)).reshape(M, B, -1)  # M, 1, 3
     end_loc = torch.masked_select(end_loc, true_traj_mask.repeat(1, 1, 3)).reshape(M, B, -1)
 
+    start_relative_loc = torch.masked_select(start_relative_loc, true_traj_mask.repeat(1, 1, 3)).reshape(M, B, -1)
+    end_relative_loc = torch.masked_select(end_relative_loc, true_traj_mask.repeat(1, 1, 3)).reshape(M, B, -1)
+
     '''
     3d position encoding
     '''
-    start_loc_encoding = utils.misc.get_3d_embedding(start_loc, num_band)
-    end_loc_encoding = utils.misc.get_3d_embedding(end_loc, num_band)
-    short_trajs_encoding = torch.concat([start_loc_encoding, end_loc_encoding], axis=-1)  # M, 1, 390
+    start_relative_loc_encoding = utils.misc.get_3d_embedding(start_relative_loc, num_band)
+    end_relative_loc_encoding = utils.misc.get_3d_embedding(end_relative_loc, num_band)
+    short_trajs_encoding = torch.concat([start_relative_loc_encoding, end_relative_loc_encoding], axis=-1)  # M, 1, 390
 
     '''
     frame patches
     '''
     frame_features_map = encoder(rgbs[0])[None, :]  #1, 8, 128, 46, 62
 
+    start_loc_for_sample = torch.concat([start_loc[:, :, 0:1]/encoder_stride,
+                                         start_loc[:, :, 1:2]/encoder_stride,
+                                         start_loc[:, :, 2:3]], dim=-1)
+
+    end_loc_for_sample = torch.concat([end_loc[:, :, 0:1]/encoder_stride,
+                                       end_loc[:, :, 1:2]/encoder_stride,
+                                       end_loc[:, :, 2:3]], dim=-1)
+
     start_frame_features = utils.samp.trilinear_sample3d(frame_features_map.permute(0, 2, 1, 3, 4),
-                                                         start_loc.permute(1, 0, 2)).permute(2, 0, 1)
+                                                         start_loc_for_sample.permute(1, 0, 2)).permute(2, 0, 1)
     end_frame_features = utils.samp.trilinear_sample3d(frame_features_map.permute(0, 2, 1, 3, 4),
-                                                         end_loc.permute(1, 0, 2)).permute(2, 0, 1)
+                                                       end_loc_for_sample.permute(1, 0, 2)).permute(2, 0, 1)
 
     short_trajs_features = torch.concat([start_frame_features, end_frame_features], dim=-1).cuda()  # M, 1, 128*2
 
