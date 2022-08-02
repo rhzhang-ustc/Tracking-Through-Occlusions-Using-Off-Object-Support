@@ -45,7 +45,7 @@ grad_acc = 1
 crop_size = (368, 496)
 
 max_iters = 10000
-log_freq = 1000
+log_freq = 1
 save_freq = 5000
 shuffle = False
 do_val = False
@@ -67,15 +67,15 @@ num_band = 32
 k = 10   # supervision
 k_vis = 100  # visualize
 feature_sample_step = 1
-vis_threshold = 0.05
+vis_threshold = 0.01
 
-log_dir = 'supporter_logs'
-model_name_suffix = 'full_version_2'
+log_dir = 'selection_logs'
+model_name_suffix = 'visible_selection_0.01'
 ckpt_dir = 'checkpoints'
 num_worker = 12
 
-model_path = 'checkpoints/01_8_2049_1e-5_p1_traj_estimation_19:40:14_full_version_1_model.pth'  # where the ckpt is
-encoder_path = 'checkpoints/01_8_2049_1e-5_p1_traj_estimation_19:40:14_full_version_1_encoder.pth'
+model_path = 'checkpoints/01_8_2049_1e-5_p1_traj_estimation_02:11:02_full_version_2_model.pth'  # where the ckpt is
+encoder_path = 'checkpoints/01_8_2049_1e-5_p1_traj_estimation_02:11:02_full_version_2_encoder.pth'
 use_ckpt = True
 
 
@@ -123,6 +123,7 @@ def run_model(model, encoder, sample, criterion, sw):
     rgbs = torch.from_numpy(sample['rgbs']).cuda().float()  # B, S, C, H, W
     trajs = sample['trajs'].cuda().float()  # B, S, N, 2
     valids = sample['valids'].cuda().float()  # B, S, N
+    visibles = sample['visibles'].cuda().float()  # B, S, N
 
     B, S, C, H, W = rgbs.shape
     _, _, N, _ = trajs.shape
@@ -134,6 +135,8 @@ def run_model(model, encoder, sample, criterion, sw):
     start_target_traj = target_traj[:, 0:1, :, :]   # B, 1, 1, 2
 
     trajs = trajs[:, :, 1:, :]  # B, S, N-1, 2
+    visibles = visibles[:, :, 1:]
+
     relative_traj = trajs - start_target_traj   # B, S, N-1, 2
 
     # 3d position encoding
@@ -154,11 +157,15 @@ def run_model(model, encoder, sample, criterion, sw):
     start_relative_loc = relative_pos[:, :-1, :, :].reshape(B, -1, 3)
     end_relative_loc = relative_pos[:, 1:, :, :].reshape(B, -1, 3)
 
+    start_loc_visible = visibles[:, :-1, :].reshape(B, -1)  # B, (S-1)*(N-1)
+    end_loc_visible = visibles[:, 1:, :].reshape(B, -1)  # B, (S-1)*(N-1)
+
     # parameter M indicate the number of trajs
     true_traj_mask = (0 < start_loc[:, :, 0]) & (start_loc[:, :, 0] < W-1) \
                      & (0 < end_loc[:, :, 0]) & (end_loc[:, :, 0] < W - 1) \
                      & (0 < start_loc[:, :, 1]) & (start_loc[:, :, 1] < H - 1) \
-                     & (0 < end_loc[:, :, 1]) & (end_loc[:, :, 1] < H - 1)
+                     & (0 < end_loc[:, :, 1]) & (end_loc[:, :, 1] < H - 1) \
+                     & (start_loc_visible > 0) & (end_loc_visible > 0)
 
     true_traj_mask = true_traj_mask.unsqueeze(-1)   # 1, M, 1
     M = int(true_traj_mask.sum())

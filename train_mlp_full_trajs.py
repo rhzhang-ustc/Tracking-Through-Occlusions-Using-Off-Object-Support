@@ -15,6 +15,7 @@ import utils.grouping
 import utils.samp
 import utils.basic
 import random
+from PIL import Image
 
 # import datasets
 import flyingthingsdataset
@@ -40,14 +41,14 @@ np.random.seed(125)
 ## choose hyps
 B = 1
 S = 8
-N = 64 +1 # we need to load at least 4 i think
+N = 256 + 1 # we need to load at least 4 i think
 lr = 1e-5
 grad_acc = 1
 
 crop_size = (368, 496)
 
 max_iters = 10000
-log_freq = 500
+log_freq = 1000
 save_freq = 5000
 shuffle = False
 do_val = False
@@ -69,17 +70,17 @@ num_band = 32
 k = 10   # supervision
 k_vis = 100  # visualize
 feature_sample_step = 1
-vis_threshold = 0.1
+vis_threshold = 0.01
 
 init_dir = 'reference_model'
 
 log_dir = 'test_logs'
-model_name_suffix = 'test'
+model_name_suffix = 'selection'
 ckpt_dir = 'checkpoints_test'
 num_worker = 12
 
-model_path = 'checkpoints_test/01_8_65_1e-4_p1_traj_estimation_19:19:04_test_model.pth'  # where the ckpt is
-encoder_path = 'checkpoints_test/01_8_65_1e-4_p1_traj_estimation_19:19:04_test_encoder.pth'
+model_path = 'checkpoints_test/01_8_65_1e-5_p1_traj_estimation_02:06:41_test_model.pth'  # where the ckpt is
+encoder_path = 'checkpoints_test/01_8_65_1e-5_p1_traj_estimation_02:06:41_test_encoder.pth'
 use_ckpt = True
 
 
@@ -90,10 +91,6 @@ def draw_arrows(frame, supporters, votes, weights, vis_thres, groundtruth, pred,
 
     k, _ = supporters.shape
     H, W, C = frame.shape
-    frame_gray = (0.299 * frame[:, :, 0]) + (0.587 * frame[:, :, 1]) + (0.114 * frame[:, :, 2])
-    frame_gray = frame_gray.reshape(H, W, 1).repeat(3, axis=-1)
-
-    frame = (frame_gray + frame)/2
 
     for idx in range(k):
         w = weights[idx]
@@ -120,7 +117,7 @@ def draw_arrows(frame, supporters, votes, weights, vis_thres, groundtruth, pred,
     return frame
 
 
-def run_pips(model, rgbs, N):
+def run_pips(model, rgbs, N, sw):
     rgbs = rgbs.cuda().float()  # B, S, C, H, W
 
     B, S, C, H, W = rgbs.shape
@@ -145,6 +142,41 @@ def run_pips(model, rgbs, N):
     rgbs = F.pad(rgbs.reshape(B * S, 3, H, W), (pad, pad, pad, pad), 'constant', 0).reshape(B, S, 3, H + pad * 2,
                                                                                             W + pad * 2)
     trajs_e = trajs_e + pad
+
+    if sw is not None and sw.save_this:
+        linewidth = 2
+
+        # visualize the input
+        o1 = sw.summ_rgbs('inputs/rgbs', utils.improc.preprocess_color(rgbs[0:1]).unbind(1))
+        # visualize the trajs overlaid on the rgbs
+        o2 = sw.summ_traj2ds_on_rgbs('outputs/trajs_on_rgbs', trajs_e[0:1], utils.improc.preprocess_color(rgbs[0:1]),
+                                     cmap='spring', linewidth=linewidth)
+        # visualize the trajs alone
+        o3 = sw.summ_traj2ds_on_rgbs('outputs/trajs_on_black', trajs_e[0:1], torch.ones_like(rgbs[0:1]) * -0.5,
+                                     cmap='spring', linewidth=linewidth)
+        # concat these for a synced wide vis
+        wide_cat = torch.cat([o1, o2, o3], dim=-1)
+        sw.summ_rgbs('outputs/wide_cat', wide_cat.unbind(1))
+
+        # write to disk, in case that's more convenient
+        '''
+        wide_list = list(wide_cat.unbind(1))
+        wide_list = [wide[0].permute(1, 2, 0).cpu().numpy() for wide in wide_list]
+        wide_list = [Image.fromarray(wide) for wide in wide_list]
+        out_fn = './out_%d.gif' % sw.global_step
+        wide_list[0].save(out_fn, save_all=True, append_images=wide_list[1:])
+        print('saved %s' % out_fn)
+        
+        '''
+
+        # animation of inference iterations
+        rgb_vis = []
+        for trajs_e_ in preds_anim:
+            trajs_e_ = trajs_e_ + pad
+            rgb_vis.append(
+                sw.summ_traj2ds_on_rgb('', trajs_e_[0:1], torch.mean(utils.improc.preprocess_color(rgbs[0:1]), dim=1),
+                                       cmap='spring', linewidth=linewidth, only_return=True))
+        sw.summ_rgbs('outputs/animated_trajs_on_rgb', rgb_vis)
 
     return trajs_e - pad
 
@@ -303,7 +335,7 @@ def run_model(model, encoder, rgbs, trajs, valids, criterion, sw):
         frac_supporters_01 += int(torch.sum(norm_w > 0.1))
         frac_supporters_005 += int(torch.sum(norm_w > 0.05))
         frac_supporters_001 += int(torch.sum(norm_w > 0.01))
-        supporter_num += len(norm_w)
+        supporter_num += int(torch.sum(norm_w > 0))
 
         '''
         visualization
@@ -427,6 +459,7 @@ def train():
     frac_01_pool_t = utils.misc.SimplePool(n_pool, version='np')
     frac_005_pool_t = utils.misc.SimplePool(n_pool, version='np')
     frac_001_pool_t = utils.misc.SimplePool(n_pool, version='np')
+    frac_0_pool_t = utils.misc.SimplePool(n_pool, version='np')
 
     if do_val:
         loss_pool_v = utils.misc.SimplePool(n_pool, version='np')
@@ -514,7 +547,10 @@ def train():
             sample['masks'] = sample['masks'].cpu().detach().numpy()
 
         rgbs = torch.from_numpy(sample['rgbs']).cuda().float()  # B, S, C, H, W
-        trajs = sample['trajs'].cuda().float()  # B, S, N, 2
+
+        # ground truth trajs
+        # trajs = sample['trajs'].cuda().float()  # B, S, N, 2
+
         valids = sample['valids'].cuda().float()  # B, S, N
 
         '''
@@ -526,7 +562,7 @@ def train():
 
         optimizer.zero_grad()
 
-        trajs_e = run_pips(pips, rgbs, N)
+        trajs_e = run_pips(pips, rgbs, N, sw_t)
 
         total_loss, frac_supporters_scaler = run_model(model, encoder, rgbs, trajs_e, valids, criterion, sw_t)
 
@@ -548,13 +584,15 @@ def train():
         frac_supporters_001 = frac_supporters_scaler[2]
         supporter_num = frac_supporters_scaler[3]
 
-        frac_01_pool_t.update([float(frac_supporters_01) / supporter_num])
-        frac_005_pool_t.update([float(frac_supporters_005) / supporter_num])
-        frac_001_pool_t.update([float(frac_supporters_001) / supporter_num])
+        frac_01_pool_t.update([float(frac_supporters_01) / N-1])
+        frac_005_pool_t.update([float(frac_supporters_005) / N-1])
+        frac_001_pool_t.update([float(frac_supporters_001) / N-1])
+        frac_0_pool_t.update([float(supporter_num)/ N-1])
 
-        sw_t.summ_scalar('outputs/percent_of_supporters/thres=0.1', frac_01_pool_t.mean() * 100)
-        sw_t.summ_scalar('outputs/percent_of_supporters/thres=0.05', frac_005_pool_t.mean() * 100)
-        sw_t.summ_scalar('outputs/percent_of_supporters/thres=0.01', frac_001_pool_t.mean() * 100)
+        sw_t.summ_scalar('outputs/percent_of_supporters/thres=0.1', 100 * frac_01_pool_t.mean())
+        sw_t.summ_scalar('outputs/percent_of_supporters/thres=0.05', 100 * frac_005_pool_t.mean())
+        sw_t.summ_scalar('outputs/percent_of_supporters/thres=0.01', 100 * frac_001_pool_t.mean())
+        sw_t.summ_scalar('outputs/percent_of_supporters/thres=0', 100 * frac_0_pool_t.mean())
 
         if do_val and (global_step) % val_freq == 0:
             torch.cuda.empty_cache()
