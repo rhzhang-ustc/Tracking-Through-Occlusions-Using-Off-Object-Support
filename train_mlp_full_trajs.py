@@ -41,8 +41,8 @@ np.random.seed(125)
 ## choose hyps
 B = 1
 S = 8
-N = 256 + 1 # we need to load at least 4 i think
-lr = 1e-5
+N = 256 + 1  # we need to load at least 4 i think
+lr = 1e-4
 grad_acc = 1
 
 crop_size = (368, 496)
@@ -67,7 +67,7 @@ feature_map_dim = 128
 encoder_stride = 8
 
 num_band = 32
-k = 10   # supervision
+k = 10  # supervision
 k_vis = 100  # visualize
 feature_sample_step = 1
 vis_threshold = 0.01
@@ -75,16 +75,16 @@ vis_threshold = 0.01
 init_dir = 'reference_model'
 
 log_dir = 'test_logs'
-model_name_suffix = 'selection'
+model_name_suffix = 'full_dataset'
 ckpt_dir = 'checkpoints_test'
 num_worker = 12
 
-model_path = 'checkpoints_test/01_8_65_1e-5_p1_traj_estimation_02:06:41_test_model.pth'  # where the ckpt is
-encoder_path = 'checkpoints_test/01_8_65_1e-5_p1_traj_estimation_02:06:41_test_encoder.pth'
-use_ckpt = True
+#model_path = 'checkpoints_test/01_8_257_1e-5_p1_traj_estimation_00:58:10_selection_model.pth'  # where the ckpt is
+#encoder_path = 'checkpoints_test/01_8_257_1e-5_p1_traj_estimation_00:58:10_selection_encoder.pth'
+use_ckpt = False
 
 
-def draw_arrows(frame, supporters, votes, weights, vis_thres, groundtruth, pred, order=False):
+def vis_vote(frame, supporters, votes, weights, vis_thres, groundtruth, pred, order=False):
     # order: draw arrow & suggest its weights
     # N, 3: supporters / votes
     # 1, 2: groundtruth /pred
@@ -111,8 +111,8 @@ def draw_arrows(frame, supporters, votes, weights, vis_thres, groundtruth, pred,
         # cv2.rectangle(frame, (start_pt[0] - 2, start_pt[1] - 2), (start_pt[0] + 2, start_pt[1] + 2), (0, 0, 255))
         cv2.rectangle(frame, (end_pt[0] - 1, end_pt[1] - 1), (end_pt[0] + 1, end_pt[1] + 1), (255, 0, 0))
 
-    cv2.circle(frame, (int(groundtruth[0]), int(groundtruth[1])), 4, (0, 0, 255), thickness=-1)
-    cv2.circle(frame, (int(pred[0]), int(pred[1])), 4, (255, 0, 0), thickness=-1)
+    cv2.circle(frame, (int(groundtruth[0]), int(groundtruth[1])), 3, (0, 0, 255), thickness=-1)
+    cv2.circle(frame, (int(pred[0]), int(pred[1])), 3, (255, 0, 0), thickness=-1)
 
     return frame
 
@@ -147,27 +147,16 @@ def run_pips(model, rgbs, N, sw):
         linewidth = 2
 
         # visualize the input
-        o1 = sw.summ_rgbs('inputs/rgbs', utils.improc.preprocess_color(rgbs[0:1]).unbind(1))
+        o1 = sw.summ_rgbs('inputs/rgbs', utils.improc.preprocess_color(rgbs[0:1]).unbind(1), only_return=True)
         # visualize the trajs overlaid on the rgbs
         o2 = sw.summ_traj2ds_on_rgbs('outputs/trajs_on_rgbs', trajs_e[0:1], utils.improc.preprocess_color(rgbs[0:1]),
-                                     cmap='spring', linewidth=linewidth)
+                                     cmap='spring', linewidth=linewidth, only_return=True)
         # visualize the trajs alone
         o3 = sw.summ_traj2ds_on_rgbs('outputs/trajs_on_black', trajs_e[0:1], torch.ones_like(rgbs[0:1]) * -0.5,
-                                     cmap='spring', linewidth=linewidth)
+                                     cmap='spring', linewidth=linewidth, only_return=True)
         # concat these for a synced wide vis
         wide_cat = torch.cat([o1, o2, o3], dim=-1)
         sw.summ_rgbs('outputs/wide_cat', wide_cat.unbind(1))
-
-        # write to disk, in case that's more convenient
-        '''
-        wide_list = list(wide_cat.unbind(1))
-        wide_list = [wide[0].permute(1, 2, 0).cpu().numpy() for wide in wide_list]
-        wide_list = [Image.fromarray(wide) for wide in wide_list]
-        out_fn = './out_%d.gif' % sw.global_step
-        wide_list[0].save(out_fn, save_all=True, append_images=wide_list[1:])
-        print('saved %s' % out_fn)
-        
-        '''
 
         # animation of inference iterations
         rgb_vis = []
@@ -181,52 +170,49 @@ def run_pips(model, rgbs, N, sw):
     return trajs_e - pad
 
 
-def run_model(model, encoder, rgbs, trajs, valids, criterion, sw):
-
+def run_model(model, encoder, rgbs, trajs, target_traj, valids, criterion, sw):
     total_loss = torch.tensor(0.0, requires_grad=True, device=device)
 
     B, S, C, H, W = rgbs.shape
-    _, _, N, _ = trajs.shape
+    _, _, N0, _ = trajs.shape
 
     '''
     generate target: one trajectory that needs to be estimate, then delete the point from trajs
     '''
-    target_traj = trajs[:, :, 0:1, :]   # B, S, 1, 2
-    start_target_traj = target_traj[:, 0:1, :, :]   # B, 1, 1, 2
-
-    trajs = trajs[:, :, 1:, :]  # B, S, N-1, 2
-    relative_traj = trajs - start_target_traj   # B, S, N-1, 2
+    start_target_traj = target_traj[:, 0:1, :, :]  # B, 1, 1, 2
+    relative_traj = trajs - start_target_traj  # B, S, N0, 2
 
     # 3d position encoding
     t_pos = torch.arange(0, S).cuda().float()
-    t_pos = t_pos.repeat([B, N-1, 1]).unsqueeze(-1)  # B, N-1, S, 1
-    t_pos = t_pos.transpose(1, 2)   # B, S, N-1, 1
+    t_pos = t_pos.repeat([B, N0, 1]).unsqueeze(-1)  # B, N0, S, 1
+    t_pos = t_pos.transpose(1, 2)  # B, S, N0, 1
 
-    relative_pos = torch.concat([relative_traj, t_pos], axis=-1)  # B, S, N-1, 3
+    relative_pos = torch.concat([relative_traj, t_pos], axis=-1)  # B, S, N0, 3
     pos = torch.concat([trajs, t_pos], axis=-1)
 
     '''
     3d position encoding
     '''
 
-    trajs_encoding = utils.misc.get_3d_embedding(relative_pos.reshape(B*S, N-1, 3), num_band)
-    trajs_encoding = trajs_encoding.reshape(B, S, N-1, -1)  # B, S, N-1, 99
+    trajs_encoding = utils.misc.get_3d_embedding(relative_pos.reshape(B * S, N0, 3), num_band)
+    trajs_encoding = trajs_encoding.reshape(B, S, N0, -1)  # B, S, N-1, 99
 
     '''
     frame patches
     '''
-    frame_features_map = encoder(rgbs.reshape(B*S, C, H, W)).reshape(B, S, feature_map_dim,
-                                                                     H//encoder_stride, W//encoder_stride)  # 1, 8, 128, 46, 62
+    frame_features_map = encoder(rgbs.reshape(B * S, C, H, W)).reshape(B, S, feature_map_dim,
+                                                                       H // encoder_stride,
+                                                                       W // encoder_stride)  # 1, 8, 128, 46, 62
 
-    pos_for_sample = torch.concat([pos[:, :, :, 0:1]/encoder_stride,
-                                  pos[:, :, :, 1:2]/encoder_stride,
-                                  pos[:, :, :, 2:3]], dim=-1)
-    pos_for_sample = pos_for_sample.reshape(B, S*(N-1), 3)
+    pos_for_sample = torch.concat([pos[:, :, :, 0:1] / encoder_stride,
+                                   pos[:, :, :, 1:2] / encoder_stride,
+                                   pos[:, :, :, 2:3]], dim=-1)
+    pos_for_sample = pos_for_sample.reshape(B, S * N0, 3)
 
     trajs_features = utils.samp.trilinear_sample3d(frame_features_map.permute(0, 2, 1, 3, 4),
-                                                   pos_for_sample)    # B, S*(N-1), 128
+                                                   pos_for_sample)  # B, S*(N0), 128
 
-    trajs_features = trajs_features.reshape(B, S, N-1, -1)  # B, S, N-1, 128
+    trajs_features = trajs_features.reshape(B, S, N0, -1)  # B, S, N0, 128
 
     '''
     target vector
@@ -234,9 +220,9 @@ def run_model(model, encoder, rgbs, trajs, valids, criterion, sw):
 
     target_traj_feature = utils.samp.bilinear_sample2d(frame_features_map[:, 0, :],
                                                        start_target_traj[:, 0, 0, 0:1] / encoder_stride,
-                                                       start_target_traj[:, 0, 0, 1:2] / encoder_stride)    # B, 128, 1
+                                                       start_target_traj[:, 0, 0, 1:2] / encoder_stride)  # B, 128, 1
 
-    target_traj_feature = target_traj_feature.permute(0, 2, 1).unsqueeze(1).repeat(1, S, N-1, 1)    # B, S, N-1, 128
+    target_traj_feature = target_traj_feature.permute(0, 2, 1).unsqueeze(1).repeat(1, S, N0, 1)  # B, S, N-1, 128
 
     '''
     relative motion
@@ -244,14 +230,14 @@ def run_model(model, encoder, rgbs, trajs, valids, criterion, sw):
 
     target_motion = (target_traj[:, 1:2, :, :] - start_target_traj)  # B, 1, 1, 2
     target_motion = torch.concat([target_motion, torch.ones(B, 1, 1, 1).cuda().float()], dim=-1)  # B, 1, 1, 3
-    motion = pos[:, 1:, :, :] - pos[:, :-1, :, :]   # B, S-1, N-1, 3
+    motion = pos[:, 1:, :, :] - pos[:, :-1, :, :]  # B, S-1, N-1, 3
 
-    mean_motion = torch.mean(motion, dim=1).reshape(B, 1, N-1, 3)
+    mean_motion = torch.mean(motion, dim=1).reshape(B, 1, N0, 3)
     motion = torch.concat([motion, mean_motion], axis=1)
 
     relative_motion = motion - target_motion
-    relative_motion_encoding = utils.misc.get_3d_embedding(relative_motion.reshape(B*S, N-1, 3), num_band)
-    relative_motion_encoding = relative_motion_encoding.reshape(B, S, N-1, -1)   # B, S, N-1, 99
+    relative_motion_encoding = utils.misc.get_3d_embedding(relative_motion.reshape(B * S, N0, 3), num_band)
+    relative_motion_encoding = relative_motion_encoding.reshape(B, S, N0, -1)  # B, S, N0, 99
 
     '''
     use perceiver model instead of perceiver io
@@ -261,25 +247,25 @@ def run_model(model, encoder, rgbs, trajs, valids, criterion, sw):
     input_matrix = torch.concat([trajs_encoding,
                                  trajs_features,
                                  relative_motion_encoding,
-                                 target_traj_feature], axis=-1)    # B, S, N-1, 454
+                                 target_traj_feature], axis=-1)  # B, S, N-1, 454
     input_matrix = input_matrix.to(device)
-    input_matrix = input_matrix.permute(0, 2, 1, 3).reshape(B, N-1, -1)  # B, N-1, S*454
+    input_matrix = input_matrix.permute(0, 2, 1, 3).reshape(B, N0, -1)  # B, N-1, S*454
 
-    pred = model(input_matrix)  # B, (N-1), S*3
+    pred = model(input_matrix)  # B, N0, S*3
 
-    pred = pred.reshape(B, N-1, S, -1).permute(0, 2, 1, 3)   # B, S, N-1, 3
+    pred = pred.reshape(B, N0, S, -1).permute(0, 2, 1, 3)  # B, S, N0, 3
 
     '''
-    generate voting features M, 1, 6
+    generate voting features
     '''
-    dx = pred[:, :, :, 0:1]    # B, S, N-1, 1
+    dx = pred[:, :, :, 0:1]  # B, S, N0, 1
     dy = pred[:, :, :, 1:2]
     dt = torch.zeros(dx.shape).cuda().float()
-    ws = pred[:, :, :, 2:3]  # B, S, N-1, 1  weight for vote that begins at start point
+    ws = pred[:, :, :, 2:3]  # B, S, N0, 1  weight for vote that begins at start point
 
     # make sure that w are normalized inside the same timestep, generate prediction
 
-    vote_matrix = torch.concat([dx, dy, dt], dim=-1)    # B, S, N-1, 3
+    vote_matrix = torch.concat([dx, dy, dt], dim=-1)  # B, S, N0, 3
 
     frame_lst = []  # for visualization
     pred_traj = torch.zeros(B, S, 1, 2)
@@ -291,19 +277,22 @@ def run_model(model, encoder, rgbs, trajs, valids, criterion, sw):
     frac_supporters_001 = 0
     supporter_num = 0
 
+    # if in any frame the traj is used as supporter, the mask is set to 1
+    supporter_mask = torch.zeros(B, 1, N0, 1).cuda()
+
     for i in range(S):
 
-        supporters = pos[:, i:i+1, :, :]    # B, 1, N-1, 3
-        votes = vote_matrix[:, i:i+1, :, :]     # B, 1, N-1, 3
-        w = ws[:, i:i+1, :, :]      # B, 1, N-1, 1
+        supporters = pos[:, i:i + 1, :, :]  # B, 1, N0, 3
+        votes = vote_matrix[:, i:i + 1, :, :]  # B, 1, N0, 3
+        w = ws[:, i:i + 1, :, :]  # B, 1, N0, 1
 
         vote_pts = supporters + votes
-        norm_w = torch.softmax(w, dim=2)    # B, 1, N-1, 1
+        norm_w = torch.softmax(w, dim=2)  # B, 1, N0, 1
 
-        pred_traj_i = torch.sum(norm_w * vote_pts, dim=2)[:, :, 0:2]    # B, 1, 2
+        pred_traj_i = torch.sum(norm_w * vote_pts, dim=2)[:, :, 0:2]  # B, 1, 2
         pred_traj[:, i, :, :] = pred_traj_i
 
-        target_traj_i = target_traj[:, i, :, :]   # B, 1, 2
+        target_traj_i = target_traj[:, i, :, :]  # B, 1, 2
 
         total_loss = total_loss + criterion(pred_traj_i, target_traj_i)
 
@@ -315,17 +304,17 @@ def run_model(model, encoder, rgbs, trajs, valids, criterion, sw):
             _, top_k_index = torch.topk(norm_w, k_temp, dim=2)
         except Exception:
             k_temp = len(norm_w)
-            _, top_k_index = torch.topk(norm_w, k_temp, dim=2)      # B, 1, 100, 1
+            _, top_k_index = torch.topk(norm_w, k_temp, dim=2)  # B, 1, 100, 1
 
-        k_supporter = supporters.index_select(2, top_k_index[0, 0, :, 0])   # 1, 1, 100, 3
+        k_supporter = supporters.index_select(2, top_k_index[0, 0, :, 0])  # 1, 1, 100, 3
         k_votes = votes.index_select(2, top_k_index[0, 0, :, 0])
         k_w = norm_w.index_select(2, top_k_index[0, 0, :, 0])
 
-        pred_matrix = (k_supporter + k_votes)[:, :, :, 0:2]     # 1, 1, 100, 2
+        pred_matrix = (k_supporter + k_votes)[:, :, :, 0:2]  # 1, 1, 100, 2
 
         # more easy way
         if k > k_temp:
-            k_i = k_temp    # number of supporters that recieve loss
+            k_i = k_temp  # number of supporters that recieve loss
         else:
             k_i = k
 
@@ -341,23 +330,28 @@ def run_model(model, encoder, rgbs, trajs, valids, criterion, sw):
         visualization
         '''
         if sw is not None and sw.save_this:
+            # visualize voting process
             frame = rgbs[0, i].transpose(0, 2).transpose(0, 1).cpu()
             frame = np.array(frame)[:, :, ::-1]
-            frame = np.ascontiguousarray(frame, dtype=np.int32)    # H, W, C
+            frame = np.ascontiguousarray(frame, dtype=np.int32)  # H, W, C
 
-            frame_drawn = draw_arrows(frame, k_supporter[0, 0].cpu().detach(),
-                                      k_votes[0, 0].cpu().detach(),
-                                      k_w[0, 0].cpu().detach(),
-                                      vis_threshold,
-                                      target_traj_i[0, 0],
-                                      pred_traj_i[0, 0],
-                                      order=False)
+            frame_drawn = vis_vote(frame, k_supporter[0, 0].cpu().detach(),
+                                   k_votes[0, 0].cpu().detach(),
+                                   k_w[0, 0].cpu().detach(),
+                                   vis_threshold,
+                                   target_traj_i[0, 0],
+                                   pred_traj_i[0, 0],
+                                   order=False)
 
-            frame_drawn = torch.from_numpy(frame_drawn).transpose(0, 1).transpose(0, 2).byte()   # C, H, W
+            frame_drawn = torch.from_numpy(frame_drawn).transpose(0, 1).transpose(0, 2).byte()  # C, H, W
             frame_lst.append(frame_drawn)
 
-    if sw is not None and sw.save_this:
+            # collect useful trajectory generate by pips
+            supporter_mask += norm_w > vis_threshold
 
+    supporter_idx = supporter_mask[0, 0, :, 0].nonzero()
+
+    if sw is not None and sw.save_this:
         gt_rgb = utils.improc.preprocess_color(
             sw.summ_traj2ds_on_rgb('', target_traj[0:1], torch.mean(utils.improc.preprocess_color(rgbs[0:1]), dim=1),
                                    valids=valids[0:1], cmap='winter', only_return=True))
@@ -369,16 +363,21 @@ def run_model(model, encoder, rgbs, trajs, valids, criterion, sw):
 
         sw.summ_rgbs('inputs_0/rgbs', utils.improc.preprocess_color(rgbs[0:1]).unbind(1))
 
-        frames = torch.stack(frame_lst, dim=0).unsqueeze(1)  # 8, 1, C, H, W
-        sw.summ_rgbs('outputs/votes_on_rgb', tuple(frames))
+        frames = torch.stack(frame_lst, dim=0)  # 8, C, H, W
+
+        sw.summ_traj2ds_on_rgbs('outputs/trajs_on_rgbs',
+                                trajs.index_select(2, supporter_idx[:, 0]),
+                                utils.improc.preprocess_color(frames[None, :]),
+                                cmap='spring')
 
         sw.summ_feats('tff/0_fmaps', frame_features_map.unbind(1))
 
-    return total_loss/S, (frac_supporters_01, frac_supporters_005, frac_supporters_001, supporter_num)
+    return total_loss / S, \
+        (frac_supporters_01, frac_supporters_005, frac_supporters_001, supporter_num), \
+        pred_traj
 
 
 def train():
-
     # model save path
     # model_path = 'checkpoints/01_8_64_32_1e-4_p1_avg_trajs_20:44:39.pth'  # where the ckpt is
     # state = torch.load(model_path)
@@ -422,7 +421,7 @@ def train():
         np.random.seed(np.random.get_state()[1][0] + worker_id)
 
     train_dataset = flyingthingsdataset.FlyingThingsDataset(
-        dset='TRAIN', subset='A',
+        dset='TRAIN', subset='all',
         use_augs=use_augs,
         N=N, S=S,
         crop_size=crop_size)
@@ -467,7 +466,7 @@ def train():
     total_loss = torch.tensor(0.0, requires_grad=True).to(device)
 
     # model = PerceiverIO(depth=6, dim=S * (dim*(2*num_band+1) + feature_dim),
-                        # queries_dim=queries_dim, logits_dim=logis_dim).to(device)
+    # queries_dim=queries_dim, logits_dim=logis_dim).to(device)
 
     '''
     model = Perceiver(depth=model_depth, fourier_encode_data=False, num_classes=6,
@@ -480,7 +479,7 @@ def train():
                       final_classifier_head=True)
     '''
 
-    model = MLP(in_dim=2 * S* ((3*num_band+3) + feature_map_dim), out_dim=S*3)
+    model = MLP(in_dim=2 * S * ((3 * num_band + 3) + feature_map_dim), out_dim=S * 3)
     model = model.to(device)
     model = torch.nn.DataParallel(model, device_ids=device_ids)
 
@@ -498,7 +497,6 @@ def train():
 
         model.load_state_dict(model_state, strict=False)
         encoder.load_state_dict(encoder_state, strict=False)
-
 
     criterion = nn.L1Loss()
     optimizer = optim.AdamW([
@@ -564,7 +562,11 @@ def train():
 
         trajs_e = run_pips(pips, rgbs, N, sw_t)
 
-        total_loss, frac_supporters_scaler = run_model(model, encoder, rgbs, trajs_e, valids, criterion, sw_t)
+        target_traj = trajs_e[:, :, 0:1, :]  # B, S, 1, 2
+        trajs_e = trajs_e[:, :, 1:, :]  # B, S, N0, 2
+
+        total_loss, frac_supporters_scaler, _ = run_model(model, encoder, rgbs, trajs_e, target_traj,
+                                                          valids, criterion, sw_t)
 
         total_loss.backward()
         optimizer.step()
@@ -584,10 +586,12 @@ def train():
         frac_supporters_001 = frac_supporters_scaler[2]
         supporter_num = frac_supporters_scaler[3]
 
-        frac_01_pool_t.update([float(frac_supporters_01) / N-1])
-        frac_005_pool_t.update([float(frac_supporters_005) / N-1])
-        frac_001_pool_t.update([float(frac_supporters_001) / N-1])
-        frac_0_pool_t.update([float(supporter_num)/ N-1])
+        total_pt_num = (N - 1) * S
+
+        frac_01_pool_t.update([frac_supporters_01 / total_pt_num])
+        frac_005_pool_t.update([frac_supporters_005 / total_pt_num])
+        frac_001_pool_t.update([frac_supporters_001 / total_pt_num])
+        frac_0_pool_t.update([supporter_num / total_pt_num])
 
         sw_t.summ_scalar('outputs/percent_of_supporters/thres=0.1', 100 * frac_01_pool_t.mean())
         sw_t.summ_scalar('outputs/percent_of_supporters/thres=0.05', 100 * frac_005_pool_t.mean())
@@ -648,6 +652,5 @@ if __name__ == '__main__':
     cache = args.use_cache
     max_iters = args.max_iters
     cache_len = args.cache_len
-
 
     train()
