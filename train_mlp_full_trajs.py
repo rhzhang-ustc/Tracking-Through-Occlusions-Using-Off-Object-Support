@@ -42,22 +42,23 @@ np.random.seed(125)
 B = 1
 S = 8
 N = 256 + 1  # we need to load at least 4 i think
-lr = 1e-4
+lr = 1e-5
 grad_acc = 1
 
 crop_size = (368, 496)
 
 max_iters = 10000
 log_freq = 1000
-save_freq = 5000
-shuffle = False
-do_val = False
+save_freq = 1000
+shuffle = True
+do_val = True
+
 cache = True
 cache_len = 100
 cache_freq = 99999999
 use_augs = False
 
-val_freq = 10
+val_freq = 1000
 
 model_depth = 1
 
@@ -72,17 +73,16 @@ k_vis = 100  # visualize
 feature_sample_step = 1
 vis_threshold = 0.01
 
+beta = 3 # importance score of top k loss
+
 init_dir = 'reference_model'
 
 log_dir = 'test_logs'
-model_name_suffix = 'full_dataset'
-ckpt_dir = 'checkpoints_test'
+model_name_suffix = 'test'
+ckpt_dir = 'checkpoints'
 num_worker = 12
 
-#model_path = 'checkpoints_test/01_8_257_1e-5_p1_traj_estimation_00:58:10_selection_model.pth'  # where the ckpt is
-#encoder_path = 'checkpoints_test/01_8_257_1e-5_p1_traj_estimation_00:58:10_selection_encoder.pth'
-use_ckpt = False
-
+use_ckpt = True
 
 def vis_vote(frame, supporters, votes, weights, vis_thres, groundtruth, pred, order=False):
     # order: draw arrow & suggest its weights
@@ -110,6 +110,7 @@ def vis_vote(frame, supporters, votes, weights, vis_thres, groundtruth, pred, or
         cv2.line(frame, start_pt, end_pt, (255, 0, 0))
         # cv2.rectangle(frame, (start_pt[0] - 2, start_pt[1] - 2), (start_pt[0] + 2, start_pt[1] + 2), (0, 0, 255))
         cv2.rectangle(frame, (end_pt[0] - 1, end_pt[1] - 1), (end_pt[0] + 1, end_pt[1] + 1), (255, 0, 0))
+        cv2.putText(frame, str(w.item()), (start_pt[0] - 2, start_pt[1] - 2), cv2.FONT_HERSHEY_COMPLEX, 0.5, (0, 0, 255), 1)
 
     cv2.circle(frame, (int(groundtruth[0]), int(groundtruth[1])), 3, (0, 0, 255), thickness=-1)
     cv2.circle(frame, (int(pred[0]), int(pred[1])), 3, (255, 0, 0), thickness=-1)
@@ -167,7 +168,7 @@ def run_pips(model, rgbs, N, sw):
                                        cmap='spring', linewidth=linewidth, only_return=True))
         sw.summ_rgbs('outputs/animated_trajs_on_rgb', rgb_vis)
 
-    return trajs_e - pad
+    return trajs_e - pad, vis_e
 
 
 def run_model(model, encoder, rgbs, trajs, target_traj, valids, criterion, sw):
@@ -177,7 +178,7 @@ def run_model(model, encoder, rgbs, trajs, target_traj, valids, criterion, sw):
     _, _, N0, _ = trajs.shape
 
     '''
-    generate target: one trajectory that needs to be estimate, then delete the point from trajs
+    generate target: one trajectory that needs to be estimate
     '''
     start_target_traj = target_traj[:, 0:1, :, :]  # B, 1, 1, 2
     relative_traj = trajs - start_target_traj  # B, S, N0, 2
@@ -198,7 +199,7 @@ def run_model(model, encoder, rgbs, trajs, target_traj, valids, criterion, sw):
     trajs_encoding = trajs_encoding.reshape(B, S, N0, -1)  # B, S, N-1, 99
 
     '''
-    frame patches
+    Sample from CNN features
     '''
     frame_features_map = encoder(rgbs.reshape(B * S, C, H, W)).reshape(B, S, feature_map_dim,
                                                                        H // encoder_stride,
@@ -233,7 +234,7 @@ def run_model(model, encoder, rgbs, trajs, target_traj, valids, criterion, sw):
     motion = pos[:, 1:, :, :] - pos[:, :-1, :, :]  # B, S-1, N-1, 3
 
     mean_motion = torch.mean(motion, dim=1).reshape(B, 1, N0, 3)
-    motion = torch.concat([motion, mean_motion], axis=1)
+    motion = torch.concat([motion, mean_motion], axis=1)    # B, S, N-1, 3
 
     relative_motion = motion - target_motion
     relative_motion_encoding = utils.misc.get_3d_embedding(relative_motion.reshape(B * S, N0, 3), num_band)
@@ -318,7 +319,7 @@ def run_model(model, encoder, rgbs, trajs, target_traj, valids, criterion, sw):
         else:
             k_i = k
 
-        total_loss = total_loss + criterion(pred_matrix[:, :, :k_i, :],
+        total_loss = total_loss + beta * criterion(pred_matrix[:, :, :k_i, :],
                                             target_traj_i[:, None, :, :].repeat(1, 1, k_i, 1))  # loss for k
 
         frac_supporters_01 += int(torch.sum(norm_w > 0.1))
@@ -365,8 +366,13 @@ def run_model(model, encoder, rgbs, trajs, target_traj, valids, criterion, sw):
 
         frames = torch.stack(frame_lst, dim=0)  # 8, C, H, W
 
-        sw.summ_traj2ds_on_rgbs('outputs/trajs_on_rgbs',
+        sw.summ_traj2ds_on_rgbs('outputs/trajs_on_rgbs_thres',
                                 trajs.index_select(2, supporter_idx[:, 0]),
+                                utils.improc.preprocess_color(frames[None, :]),
+                                cmap='spring')
+
+        sw.summ_traj2ds_on_rgbs('outputs/trajs_on_rgbs',
+                                trajs,
                                 utils.improc.preprocess_color(frames[None, :]),
                                 cmap='spring')
 
@@ -410,9 +416,6 @@ def train():
     model_name = model_name + '_' + model_date + '_' + model_name_suffix
     print('model_name', model_name)
 
-    model_ckpt_path = ckpt_dir + '/' + model_name + '_model.pth'
-    encoder_ckpt_path = ckpt_dir + '/' + model_name + '_encoder.pth'
-
     writer_t = SummaryWriter(log_dir + '/' + model_name + '/t', max_queue=10, flush_secs=60)
     if do_val:
         writer_v = SummaryWriter(log_dir + '/' + model_name + '/v', max_queue=10, flush_secs=60)
@@ -443,12 +446,13 @@ def train():
         print('not using augs in val')
         val_dataset = flyingthingsdataset.FlyingThingsDataset(dset='TEST', subset='all',
                                                               use_augs=False, N=N, S=S, crop_size=crop_size,
-                                                              version='ak')
+                                                              )
         val_dataloader = DataLoader(
             val_dataset,
             batch_size=1,
-            shuffle=shuffle,
-            num_workers=1)
+            shuffle=False,
+            num_workers=12,
+            pin_memory= True)
         val_iterloader = iter(val_dataloader)
 
     global_step = 0
@@ -460,24 +464,15 @@ def train():
     frac_001_pool_t = utils.misc.SimplePool(n_pool, version='np')
     frac_0_pool_t = utils.misc.SimplePool(n_pool, version='np')
 
+    n_pool_v = 10
     if do_val:
-        loss_pool_v = utils.misc.SimplePool(n_pool, version='np')
+        loss_pool_v = utils.misc.SimplePool(n_pool_v, version='np')
+        frac_01_pool_v = utils.misc.SimplePool(n_pool_v, version='np')
+        frac_005_pool_v = utils.misc.SimplePool(n_pool_v, version='np')
+        frac_001_pool_v = utils.misc.SimplePool(n_pool_v, version='np')
+        frac_0_pool_v = utils.misc.SimplePool(n_pool_v, version='np')
 
     total_loss = torch.tensor(0.0, requires_grad=True).to(device)
-
-    # model = PerceiverIO(depth=6, dim=S * (dim*(2*num_band+1) + feature_dim),
-    # queries_dim=queries_dim, logits_dim=logis_dim).to(device)
-
-    '''
-    model = Perceiver(depth=model_depth, fourier_encode_data=False, num_classes=6,
-                      num_freq_bands=64,
-                      max_freq=N,
-                      input_axis=1,
-                      num_latents=512,
-                      latent_dim=512,
-                      input_channels=2 * ((3*num_band+3) + feature_dim) + 3,
-                      final_classifier_head=True)
-    '''
 
     model = MLP(in_dim=2 * S * ((3 * num_band + 3) + feature_map_dim), out_dim=S * 3)
     model = model.to(device)
@@ -492,11 +487,12 @@ def train():
     pips.eval()
 
     if use_ckpt:
-        model_state = torch.load(model_path)
-        encoder_state = torch.load(encoder_path)
 
-        model.load_state_dict(model_state, strict=False)
-        encoder.load_state_dict(encoder_state, strict=False)
+        saverloader.load(ckpt_dir, model, optimizer=None, scheduler=None, model_ema=None, step=0, model_name='model',
+                         ignore_load=None)
+        saverloader.load(ckpt_dir, encoder, optimizer=None, scheduler=None, model_ema=None, step=0, model_name='encoder',
+                         ignore_load=None)
+
 
     criterion = nn.L1Loss()
     optimizer = optim.AdamW([
@@ -560,13 +556,13 @@ def train():
 
         optimizer.zero_grad()
 
-        trajs_e = run_pips(pips, rgbs, N, sw_t)
+        trajs_e, vis_e = run_pips(pips, rgbs, N, sw_t)
 
         target_traj = trajs_e[:, :, 0:1, :]  # B, S, 1, 2
-        trajs_e = trajs_e[:, :, 1:, :]  # B, S, N0, 2
+        trajs_e = trajs_e[:, :, 1:, :]  # B, S, N0, 2 where N0 = N-2
 
         total_loss, frac_supporters_scaler, _ = run_model(model, encoder, rgbs, trajs_e, target_traj,
-                                                          valids, criterion, sw_t)
+                                                          vis_e, criterion, sw_t)
 
         total_loss.backward()
         optimizer.step()
@@ -614,14 +610,42 @@ def train():
             except StopIteration:
                 val_iterloader = iter(val_dataloader)
                 sample = next(val_iterloader)
+
             sample['rgbs'] = sample['rgbs'].cpu().detach().numpy()
-            sample['masks'] = sample['masks'].cpu().detach().numpy()
+            rgbs = torch.from_numpy(sample['rgbs']).cuda().float()  # B, S, C, H, W
+            valids = sample['valids'].cuda().float()  # B, S, N
 
             with torch.no_grad():
-                total_loss = run_model(model, sample, criterion, optimizer)
+                trajs_e, vis_e = run_pips(pips, rgbs, N, sw_t)
+
+                target_traj = trajs_e[:, :, 0:1, :]  # B, S, 1, 2
+                trajs_e = trajs_e[:, :, 1:, :]  # B, S, N0, 2
+
+                total_loss, frac_supporters_scaler, _ = run_model(model, encoder, rgbs, trajs_e, target_traj,
+                                                                  vis_e, criterion, sw_v)
             sw_v.summ_scalar('total_loss', total_loss)
             loss_pool_v.update([total_loss.detach().cpu().numpy()])
             sw_v.summ_scalar('pooled/total_loss', loss_pool_v.mean())
+
+            frac_supporters_01 = frac_supporters_scaler[0]
+            if frac_supporters_01 is None:
+                continue
+
+            frac_supporters_005 = frac_supporters_scaler[1]
+            frac_supporters_001 = frac_supporters_scaler[2]
+            supporter_num = frac_supporters_scaler[3]
+
+            total_pt_num = (N - 1) * S
+
+            frac_01_pool_v.update([frac_supporters_01 / total_pt_num])
+            frac_005_pool_v.update([frac_supporters_005 / total_pt_num])
+            frac_001_pool_v.update([frac_supporters_001 / total_pt_num])
+            frac_0_pool_v.update([supporter_num / total_pt_num])
+
+            sw_t.summ_scalar('outputs/percent_of_supporters/thres=0.1', 100 * frac_01_pool_v.mean())
+            sw_t.summ_scalar('outputs/percent_of_supporters/thres=0.05', 100 * frac_005_pool_v.mean())
+            sw_t.summ_scalar('outputs/percent_of_supporters/thres=0.01', 100 * frac_001_pool_v.mean())
+            sw_t.summ_scalar('outputs/percent_of_supporters/thres=0', 100 * frac_0_pool_v.mean())
 
         iter_time = time.time() - iter_start_time
         print('%s; step %06d/%d; rtime %.2f; itime %.2f; loss = %.5f' % (
@@ -629,8 +653,8 @@ def train():
             total_loss.item()))
 
         if not global_step % save_freq:
-            torch.save(model.state_dict(), model_ckpt_path)
-            torch.save(encoder.state_dict(), encoder_ckpt_path)
+            saverloader.save(ckpt_dir, optimizer, encoder, global_step, model_name='encoder')
+            saverloader.save(ckpt_dir, optimizer, model, global_step, model_name='model')
 
     writer_t.close()
     if do_val:

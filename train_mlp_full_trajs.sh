@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --partition=orion --qos=normal
-#SBATCH --time=24:00:00
+#SBATCH --time=48:00:00
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=96G
@@ -23,7 +23,7 @@ echo "SLURMTMPDIR="$SLURMTMPDIR
 echo "working directory = "$SLURM_SUBMIT_DIR
 
 # process
-python3 train_mlp_full_trajs.py --max_iters 200000
+python3 train_mlp_full_trajs.py --max_iters 400000
 
 # can try the following to list out which GPU you have access to
 # srun /usr/local/cuda/samples/1_Utilities/deviceQuery/deviceQuery

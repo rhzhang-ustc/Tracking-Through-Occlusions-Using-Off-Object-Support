@@ -52,14 +52,14 @@ feature_sample_step = 1
 vis_threshold = 0.01
 
 init_dir = 'reference_model'
+ckpt_dir = 'checkpoints'
+
+video_path = './demo_videos/ethCup_input.mp4'
+
 num_worker = 12
 
 log_dir = 'demo_logs'
-
-model_path = 'checkpoints_test/01_8_257_1e-5_p1_traj_estimation_00:58:10_selection_model.pth'  # where the ckpt is
-encoder_path = 'checkpoints_test/01_8_257_1e-5_p1_traj_estimation_00:58:10_selection_encoder.pth'
-
-target_0 = (95, 109)     # center of the cup
+target_0 = (173, 167)     # center of the cup, H, W
 
 
 def split_frames(video_path, output_path, start, end, step):
@@ -67,14 +67,19 @@ def split_frames(video_path, output_path, start, end, step):
     cap = cv2.VideoCapture(video_path)
     count = 0
 
+    if not os.path.exists(output_path):
+        os.makedirs(output_path)
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
         h, w, c = np.array(frame).shape
-        frame = cv2.resize(frame, dsize=(int(w/2), int(h/2)))
         if start <= count < end and (count - start) % step == 0:
+
+            cv2.circle(frame, (int(target_0[0]), int(target_0[1])), 3, (0, 0, 255), thickness=-1)
+            frame = cv2.resize(frame, (640, 360))
             cv2.imwrite(output_path + '/' + '%04d' % count + '.jpg', frame)
         count += 1
 
@@ -84,7 +89,7 @@ def test_model():
 
     exp_name = '00'  # (exp_name is used for logging notes that correspond to different runs)
 
-    split_frames('./demo_videos/ethCup_input.mp4', './demo_images', 0, 1000, 1)
+    split_frames(video_path, './demo_images', 0, 1000, 1)
 
     filenames = glob.glob('./demo_images/*.jpg')
     filenames = sorted(filenames)
@@ -115,11 +120,10 @@ def test_model():
     saverloader.load(init_dir, pips)
     pips.eval()
 
-    model_state = torch.load(model_path)
-    encoder_state = torch.load(encoder_path)
-
-    model.load_state_dict(model_state, strict=False)
-    encoder.load_state_dict(encoder_state, strict=False)
+    saverloader.load(ckpt_dir, model, optimizer=None, scheduler=None, model_ema=None, step=0, model_name='model',
+                     ignore_load=None)
+    saverloader.load(ckpt_dir, encoder, optimizer=None, scheduler=None, model_ema=None, step=0, model_name='encoder',
+                     ignore_load=None)
 
     valids = torch.ones(B, S, N).cuda().float()  # B, S, N
     criterion = nn.L1Loss()
@@ -151,14 +155,20 @@ def test_model():
                 im = imageio.imread(fn)
                 im = im.astype(np.uint8)
                 rgbs.append(torch.from_numpy(im).permute(2, 0, 1))
+
             rgbs = torch.stack(rgbs, dim=0).unsqueeze(0).to(device).float()  # 1, S, C, H, W
+            rgbs = rgbs.flip(2)
 
             read_time = time.time() - read_start_time
             iter_start_time = time.time()
 
             with torch.no_grad():
-                trajs_e = run_pips(pips, rgbs, N, sw_t).to(device)
-                _, _, pred_traj = run_model(model, encoder, rgbs, trajs_e, target, valids, criterion, sw_t)
+
+                trajs_e, vis_e = run_pips(pips, rgbs, N, sw_t)
+                trajs_e = trajs_e.to(device)
+                vis_e = vis_e.to(device)
+
+                _, _, pred_traj = run_model(model, encoder, rgbs, trajs_e, target, vis_e, criterion, sw_t)
                 target = pred_traj[:, -1, :, :].repeat(1, S, 1, 1).to(device)
 
             iter_time = time.time() - iter_start_time
