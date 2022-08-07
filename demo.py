@@ -49,7 +49,7 @@ num_band = 32
 k = 10  # supervision
 k_vis = 100  # visualize
 feature_sample_step = 1
-vis_threshold = 0.01
+vis_threshold = 0.1
 
 init_dir = 'reference_model'
 ckpt_dir = 'checkpoints'
@@ -59,7 +59,7 @@ video_path = './demo_videos/ethCup_input.mp4'
 num_worker = 12
 
 log_dir = 'demo_logs'
-target_0 = (173, 167)     # center of the cup, H, W
+target_0 = (173, 166)     # center of the cup, H, W
 
 
 def split_frames(video_path, output_path, start, end, step):
@@ -79,7 +79,7 @@ def split_frames(video_path, output_path, start, end, step):
         if start <= count < end and (count - start) % step == 0:
 
             cv2.circle(frame, (int(target_0[0]), int(target_0[1])), 3, (0, 0, 255), thickness=-1)
-            frame = cv2.resize(frame, (640, 360))
+            frame = cv2.resize(frame, (496, 368))
             cv2.imwrite(output_path + '/' + '%04d' % count + '.jpg', frame)
         count += 1
 
@@ -108,7 +108,7 @@ def test_model():
 
     writer_t = SummaryWriter(log_dir + '/' + model_name + '/t', max_queue=10, flush_secs=60)
 
-    model = MLP(in_dim=2 * S * ((3 * num_band + 3) + feature_map_dim), out_dim=S * 3)
+    model = MLP(in_dim=S * ((3 * num_band + 3) + (2 * num_band + 2) + 2 * feature_map_dim), out_dim=S * 3)
     model = model.to(device)
     model = torch.nn.DataParallel(model, device_ids=device_ids)
 
