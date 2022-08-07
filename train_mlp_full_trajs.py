@@ -56,7 +56,7 @@ do_val = True
 cache = True
 cache_len = 100
 cache_freq = 99999999
-use_augs = False
+use_augs = True
 
 val_freq = 1000
 
@@ -71,14 +71,14 @@ num_band = 32
 k = 10  # supervision
 k_vis = 100  # visualize
 feature_sample_step = 1
-vis_threshold = 0.01
+vis_threshold = 0.1
 
 beta = 3 # importance score of top k loss
 
 init_dir = 'reference_model'
 
 log_dir = 'test_logs'
-model_name_suffix = 'test'
+model_name_suffix = 'scrath_aug'
 ckpt_dir = 'checkpoints'
 num_worker = 12
 
@@ -123,7 +123,7 @@ def run_pips(model, rgbs, N, sw):
 
     B, S, C, H, W = rgbs.shape
     rgbs_ = rgbs.reshape(B * S, C, H, W)
-    H_, W_ = 360, 640
+    H_, W_ = crop_size #360, 640
     rgbs_ = F.interpolate(rgbs_, (H_, W_), mode='bilinear')
     H, W = H_, W_
     rgbs = rgbs_.reshape(B, S, C, H, W)
@@ -237,8 +237,11 @@ def run_model(model, encoder, rgbs, trajs, target_traj, valids, criterion, sw):
     motion = torch.concat([motion, mean_motion], axis=1)    # B, S, N-1, 3
 
     relative_motion = motion - target_motion
-    relative_motion_encoding = utils.misc.get_3d_embedding(relative_motion.reshape(B * S, N0, 3), num_band)
-    relative_motion_encoding = relative_motion_encoding.reshape(B, S, N0, -1)  # B, S, N0, 99
+
+    relative_motion = relative_motion[:, :, :, 0:2]
+
+    relative_motion_encoding = utils.misc.get_2d_embedding(relative_motion.reshape(B * S, N0, 2), num_band)
+    relative_motion_encoding = relative_motion_encoding.reshape(B, S, N0, -1)  # B, S, N0, 66
 
     '''
     use perceiver model instead of perceiver io
@@ -248,9 +251,9 @@ def run_model(model, encoder, rgbs, trajs, target_traj, valids, criterion, sw):
     input_matrix = torch.concat([trajs_encoding,
                                  trajs_features,
                                  relative_motion_encoding,
-                                 target_traj_feature], axis=-1)  # B, S, N-1, 454
+                                 target_traj_feature], axis=-1)  # B, S, N-1, 421
     input_matrix = input_matrix.to(device)
-    input_matrix = input_matrix.permute(0, 2, 1, 3).reshape(B, N0, -1)  # B, N-1, S*454
+    input_matrix = input_matrix.permute(0, 2, 1, 3).reshape(B, N0, -1)  # B, N-1, S*421
 
     pred = model(input_matrix)  # B, N0, S*3
 
@@ -474,7 +477,7 @@ def train():
 
     total_loss = torch.tensor(0.0, requires_grad=True).to(device)
 
-    model = MLP(in_dim=2 * S * ((3 * num_band + 3) + feature_map_dim), out_dim=S * 3)
+    model = MLP(in_dim=S * ((3 * num_band + 3) + (2 * num_band + 2) + 2 * feature_map_dim), out_dim=S * 3)
     model = model.to(device)
     model = torch.nn.DataParallel(model, device_ids=device_ids)
 
