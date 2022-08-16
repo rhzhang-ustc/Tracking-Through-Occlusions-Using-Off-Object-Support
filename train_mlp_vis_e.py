@@ -79,8 +79,8 @@ alpha = 3
 init_dir = 'reference_model'
 
 log_dir = 'mlp_logs'
-model_name_suffix = 'simplified_v1_rand'
-ckpt_dir = 'checkpoints_v1_rand'
+model_name_suffix = 'mlp_vis_e'
+ckpt_dir = 'checkpoints_v1_vis_e'
 num_worker = 12
 
 use_ckpt = False
@@ -255,9 +255,10 @@ def run_model(model, encoder, rgbs, trajs, target_traj, valids, criterion, sw):
     input_matrix = torch.concat([trajs_encoding,
                                  trajs_features,
                                  relative_motion_encoding,
-                                 target_traj_feature], axis=-1)
+                                 target_traj_feature,
+                                 valids.permute(0, 2, 1)], axis=-1)
 
-    input_matrix = input_matrix.to(device)  # B, N0, 1510
+    input_matrix = input_matrix.to(device)  # B, N0, 1518
     pred = model(input_matrix)  # B, N0, S*3
 
     pred = pred.reshape(B, N0, S, -1).permute(0, 2, 1, 3)   # B, S, N0, 3
@@ -486,7 +487,7 @@ def train():
 
     total_loss = torch.tensor(0.0, requires_grad=True).to(device)
 
-    model = MLP(in_dim=S * (3 * num_band + 3) + 2 * feature_map_dim + (S-1) * (2 * num_band + 2),
+    model = MLP(in_dim=S * (3 * num_band + 3) + 2 * feature_map_dim + (S-1) * (2 * num_band + 2) + S,
                 out_dim=S * 3,
                 hidden_dim=4096
     )
@@ -580,9 +581,10 @@ def train():
 
         target_traj = trajs_e[:, :, target_idx:target_idx+1, :]  # B, S, 1, 2
         trajs_e = torch.cat([trajs_e[:, :, :target_idx, :], trajs_e[:, :, target_idx+1:, :]], dim=2)  # B, S, N0, 2 where N0 = N-2
+        vis_e = torch.cat([vis_e[:, :, :target_idx], vis_e[:, :, target_idx+1:]], dim=2)    # B, S, N0
 
         total_loss, frac_supporters_scaler, avg_error, _ = run_model(model, encoder, rgbs, trajs_e, target_traj,
-                                                                     valids, criterion, sw_t)
+                                                                     vis_e, criterion, sw_t)
 
         total_loss.backward()
         optimizer.step()
@@ -645,6 +647,7 @@ def train():
 
                 target_traj = trajs_e[:, :, 0:1, :]  # B, S, 1, 2
                 trajs_e = trajs_e[:, :, 1:, :]  # B, S, N0, 2
+                vis_e = vis_e[:, :, 1:]
 
                 total_loss, frac_supporters_scaler, avg_error, _ = run_model(model, encoder, rgbs, trajs_e, target_traj,
                                                                              vis_e, criterion, sw_v)

@@ -1,15 +1,15 @@
 #!/bin/bash
 #SBATCH --partition=orion --qos=normal
-#SBATCH --time=96:00:00
+#SBATCH --time=12:00:00
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=12
-#SBATCH --mem=96G
+#SBATCH --mem=32G
 
 # only use the following on partition with GPUs
 #SBATCH --gres=gpu:1
 
-#SBATCH --job-name="mlp_sigmoid"
-#SBATCH --output=mlp_sigmoid-%j.out
+#SBATCH --job-name="mlp_eval"
+#SBATCH --output=mlp_eval-%j.out
 
 # only use the following if you want email notification
 #SBATCH --mail-user=zrh20010804@mail.ustc.edu.cn
@@ -23,7 +23,7 @@ echo "SLURMTMPDIR="$SLURMTMPDIR
 echo "working directory = "$SLURM_SUBMIT_DIR
 
 # process
-python3 train_mlp_sigmoid.py --max_iters 400000
+python3 evaluation_mlp.py
 
 # can try the following to list out which GPU you have access to
 # srun /usr/local/cuda/samples/1_Utilities/deviceQuery/deviceQuery
