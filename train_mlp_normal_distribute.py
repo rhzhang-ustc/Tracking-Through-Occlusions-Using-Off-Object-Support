@@ -79,8 +79,8 @@ alpha = 3
 init_dir = 'reference_model'
 
 log_dir = 'train_logs'
-model_name_suffix = 'mlp'
-ckpt_dir = 'checkpoints_v1'
+model_name_suffix = 'mlp_normal'
+ckpt_dir = 'checkpoints_normal_distribute'
 num_worker = 12
 
 use_ckpt = False
@@ -125,7 +125,7 @@ def vis_vote(frame, supporters, votes, weights, vis_thres, groundtruth, pred, co
     return frame
 
 
-def run_pips(model, rgbs, N, sw):
+def run_pips(model, target, rgbs, N, sw):
     rgbs = rgbs.cuda().float()  # B, S, C, H, W
 
     B, S, C, H, W = rgbs.shape
@@ -135,13 +135,18 @@ def run_pips(model, rgbs, N, sw):
     H, W = H_, W_
     rgbs = rgbs_.reshape(B, S, C, H, W)
 
-    # pick N points to track; we'll use a uniform grid
-    N_ = np.sqrt(N).round().astype(np.int32)
-    grid_y, grid_x = utils.basic.meshgrid2d(B, N_, N_, stack=False, norm=False, device='cuda')
-    grid_y = 8 + grid_y.reshape(B, -1) / float(N_ - 1) * (H - 16)
-    grid_x = 8 + grid_x.reshape(B, -1) / float(N_ - 1) * (W - 16)
-    xy = torch.stack([grid_x, grid_y], dim=-1)  # B, N_*N_, 2
     _, S, C, H, W = rgbs.shape
+
+    sigma = 20
+
+    delta_x = torch.randn((B, 1)).repeat(1, N-1).cuda() * sigma
+    delta_y = torch.randn((B, 1)).repeat(1, N-1).cuda() * sigma
+
+    x = torch.randn((B, N-1)).cuda() * sigma + target[:, 0, 0, 0:1].repeat(1, N-1) + delta_x
+    y = torch.randn((B, N-1)).cuda() * sigma + target[:, 0, 0, 1:2].repeat(1, N-1) + delta_y
+    xy = torch.stack([x, y], axis=-1)
+
+    xy = torch.concat([target[:, 0, :, :], xy], axis=-2)
 
     preds, preds_anim, vis_e, stats = model(xy, rgbs, iters=6)
     trajs_e = preds[-1]
@@ -179,7 +184,6 @@ def run_pips(model, rgbs, N, sw):
 
 
 def run_model(model, encoder, rgbs, trajs, target_traj, valids, criterion, sw):
-
     total_loss = torch.tensor(0.0, requires_grad=True, device=device)
 
     B, S, C, H, W = rgbs.shape
@@ -297,11 +301,6 @@ def run_model(model, encoder, rgbs, trajs, target_traj, valids, criterion, sw):
 
         vote_pts = supporters + votes
         norm_w = torch.softmax(w, dim=2)  # B, 1, N0, 1
-
-        '''
-        norm_w = torch.sigmoid(w)  # B, 1, N0, 1
-        norm_w = norm_w/torch.sum(norm_w, dim=-2)
-        '''
 
         pred_traj_i = torch.sum(norm_w * vote_pts, dim=2)[:, :, 0:2]  # B, 1, 2
         pred_traj[:, i, :, :] = pred_traj_i
@@ -563,8 +562,6 @@ def train():
             sample['rgbs'] = sample['rgbs'].cpu().detach().numpy()
             sample['masks'] = sample['masks'].cpu().detach().numpy()
 
-        rgbs = torch.from_numpy(sample['rgbs']).cuda().float()  # B, S, C, H, W
-
         # ground truth trajs
         # trajs = sample['trajs'].cuda().float()  # B, S, N, 2
 
@@ -581,11 +578,9 @@ def train():
 
         optimizer.zero_grad()
 
-        trajs_e, vis_e = run_pips(pips, rgbs, N, sw_t)  # N-2
-
-        N0 = trajs.shape[2]
-        target_idx = int(torch.randint(0, N0 - 1, (1,)))
-        target_traj = trajs[:, :, target_idx:target_idx+1, :]  # B, S, 1, 2
+        target_index = torch.randint(0, N-1, (1,))
+        target_traj = trajs[:, :, target_index:target_index+1, :]    # B, S, 1, 2
+        trajs_e, vis_e = run_pips(pips, target_traj, rgbs, N, sw_t)  # N-2
 
         total_loss, frac_supporters_scaler, avg_error, _ = run_model(model, encoder, rgbs, trajs_e, target_traj,
                                                                      vis_e, criterion, sw_t)
@@ -647,11 +642,10 @@ def train():
             valids = sample['valids'].cuda().float()  # B, S, N
 
             with torch.no_grad():
-                trajs_e, vis_e = run_pips(pips, rgbs, N, sw_t)
 
-                target_traj = trajs_e[:, :, 0:1, :]  # B, S, 1, 2
-                trajs_e = trajs_e[:, :, 1:, :]  # B, S, N0, 2
-                vis_e = vis_e[:, :, 1:]
+                target_index = int(torch.randint(0, N - 1, (1,)))
+                target_traj = trajs[:, :, target_index:target_index + 1, :]  # B, S, 1, 2
+                trajs_e, vis_e = run_pips(pips, target_traj, rgbs, N, sw_t)  # N-2
 
                 total_loss, frac_supporters_scaler, avg_error, _ = run_model(model, encoder, rgbs, trajs_e, target_traj,
                                                                              vis_e, criterion, sw_v)

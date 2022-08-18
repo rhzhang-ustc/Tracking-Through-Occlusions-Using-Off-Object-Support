@@ -19,6 +19,7 @@ from PIL import Image
 
 # import datasets
 import flyingthingsdataset
+import crohddataset
 
 import torch
 import torch.nn as nn
@@ -42,27 +43,12 @@ np.random.seed(125)
 B = 1
 S = 8
 N = 256 + 1  # we need to load at least 4 i think
-lr = 1e-4
-grad_acc = 1
 
 crop_size = (368, 496)
 
-max_iters = 10000
-log_freq = 1000
-save_freq = 5000
-shuffle = True
-do_val = True
+log_freq = 50
+shuffle = False
 
-cache = True
-cache_len = 100
-cache_freq = 99999999
-use_augs = True
-
-val_freq = 50
-
-model_depth = 1
-
-queries_dim = 27 + 2
 dim = 3
 feature_map_dim = 128
 encoder_stride = 8
@@ -71,20 +57,17 @@ num_band = 32
 k = 10  # supervision
 k_vis = 100  # visualize
 feature_sample_step = 1
-vis_threshold = 0.1
+vis_threshold = 0.01
 
 beta = 3 # importance score of top k loss
 alpha = 3
 
 init_dir = 'reference_model'
 
-log_dir = 'train_logs'
-model_name_suffix = 'mlp'
+log_dir = 'eval_logs'
 ckpt_dir = 'checkpoints_v1'
+model_name_suffix = 'generalize'
 num_worker = 12
-
-use_ckpt = False
-
 
 def vis_vote(frame, supporters, votes, weights, vis_thres, groundtruth, pred, color=False):
     # order: draw arrow & suggest its weights
@@ -129,11 +112,6 @@ def run_pips(model, rgbs, N, sw):
     rgbs = rgbs.cuda().float()  # B, S, C, H, W
 
     B, S, C, H, W = rgbs.shape
-    rgbs_ = rgbs.reshape(B * S, C, H, W)
-    H_, W_ = crop_size #360, 640
-    rgbs_ = F.interpolate(rgbs_, (H_, W_), mode='bilinear')
-    H, W = H_, W_
-    rgbs = rgbs_.reshape(B, S, C, H, W)
 
     # pick N points to track; we'll use a uniform grid
     N_ = np.sqrt(N).round().astype(np.int32)
@@ -179,7 +157,6 @@ def run_pips(model, rgbs, N, sw):
 
 
 def run_model(model, encoder, rgbs, trajs, target_traj, valids, criterion, sw):
-
     total_loss = torch.tensor(0.0, requires_grad=True, device=device)
 
     B, S, C, H, W = rgbs.shape
@@ -259,7 +236,7 @@ def run_model(model, encoder, rgbs, trajs, target_traj, valids, criterion, sw):
                                  target_traj_feature,
                                  valids.permute(0, 2, 1)], axis=-1)
 
-    input_matrix = input_matrix.to(device)  # B, N0, 1518
+    input_matrix = input_matrix.to(device)  # B, N0, 1510
     pred = model(input_matrix)  # B, N0, S*3
 
     pred = pred.reshape(B, N0, S, -1).permute(0, 2, 1, 3)   # B, S, N0, 3
@@ -297,11 +274,6 @@ def run_model(model, encoder, rgbs, trajs, target_traj, valids, criterion, sw):
 
         vote_pts = supporters + votes
         norm_w = torch.softmax(w, dim=2)  # B, 1, N0, 1
-
-        '''
-        norm_w = torch.sigmoid(w)  # B, 1, N0, 1
-        norm_w = norm_w/torch.sum(norm_w, dim=-2)
-        '''
 
         pred_traj_i = torch.sum(norm_w * vote_pts, dim=2)[:, :, 0:2]  # B, 1, 2
         pred_traj[:, i, :, :] = pred_traj_i
@@ -365,14 +337,18 @@ def run_model(model, encoder, rgbs, trajs, target_traj, valids, criterion, sw):
 
     supporter_idx = supporter_mask[0, 0, :, 0].nonzero()
 
-    avg_traj_error = torch.sum(torch.abs(pred_traj-target_traj)) / S
+    pred_traj = pred_traj - (pred_traj[0, 0, 0, :] - target_traj[0, 0, 0, :])
+
+    avg_traj_error = torch.norm((pred_traj-target_traj), 2, dim=-1)
+    avg_traj_error = torch.mean(avg_traj_error)
 
     if sw is not None and sw.save_this:
         gt_rgb = utils.improc.preprocess_color(
             sw.summ_traj2ds_on_rgb('', target_traj[0:1], torch.mean(utils.improc.preprocess_color(rgbs[0:1]), dim=1),
-                                   valids=valids[0:1], cmap='winter', only_return=True))
+                                   valids=torch.ones_like(valids[0:1]), cmap='winter', only_return=True))
         gt_black = utils.improc.preprocess_color(
-            sw.summ_traj2ds_on_rgb('', target_traj[0:1], torch.ones_like(rgbs[0:1, 0]) * -0.5, valids=valids[0:1],
+            sw.summ_traj2ds_on_rgb('', target_traj[0:1], torch.ones_like(rgbs[0:1, 0]) * -0.5,
+                                   valids=torch.ones_like(valids[0:1]),
                                    cmap='winter', only_return=True))
         sw.summ_traj2ds_on_rgb('outputs/single_trajs_on_gt_rgb', pred_traj[0:1], gt_rgb[0:1], cmap='spring')
         sw.summ_traj2ds_on_rgb('outputs/single_trajs_on_gt_black', pred_traj[0:1], gt_black[0:1], cmap='spring')
@@ -399,6 +375,51 @@ def run_model(model, encoder, rgbs, trajs, target_traj, valids, criterion, sw):
         pred_traj
 
 
+def run_pips_eval(model, target, rgbs, valids, sw):
+    rgbs = rgbs.cuda().float()
+
+    B, S, C, H, W = rgbs.shape
+
+    preds, preds_anim, vis_e, stats = model(target[:, 0, :, :], rgbs, iters=6)
+    trajs_e = preds[-1]
+
+    pad = 50
+    rgbs = F.pad(rgbs.reshape(B * S, 3, H, W), (pad, pad, pad, pad), 'constant', 0).reshape(B, S, 3, H + pad * 2,
+                                                                                            W + pad * 2)
+    trajs_e = trajs_e + pad
+
+    if sw is not None and sw.save_this:
+        linewidth = 2
+
+        # visualize the input
+        o1 = sw.summ_rgbs('inputs/rgbs', utils.improc.preprocess_color(rgbs[0:1]).unbind(1), only_return=True)
+        # visualize the trajs overlaid on the rgbs
+        o2 = sw.summ_traj2ds_on_rgbs('outputs/trajs_on_rgbs', trajs_e[0:1], utils.improc.preprocess_color(rgbs[0:1]),
+                                     cmap='spring', linewidth=linewidth, only_return=True)
+        # visualize the trajs alone
+        o3 = sw.summ_traj2ds_on_rgbs('outputs/trajs_on_black', trajs_e[0:1], torch.ones_like(rgbs[0:1]) * -0.5,
+                                     cmap='spring', linewidth=linewidth, only_return=True)
+        # concat these for a synced wide vis
+        wide_cat = torch.cat([o1, o2, o3], dim=-1)
+        sw.summ_rgbs('outputs/wide_cat', wide_cat.unbind(1))
+
+        # animation of inference iterations
+        rgb_vis = []
+        for trajs_e_ in preds_anim:
+            trajs_e_ = trajs_e_ + pad
+            rgb_vis.append(
+                sw.summ_traj2ds_on_rgb('', trajs_e_[0:1], torch.mean(utils.improc.preprocess_color(rgbs[0:1]), dim=1),
+                                       cmap='spring', linewidth=linewidth, only_return=True))
+        sw.summ_rgbs('outputs/animated_trajs_on_rgb', rgb_vis)
+
+        gt_rgb = utils.improc.preprocess_color(
+            sw.summ_traj2ds_on_rgb('', target[0:1], torch.mean(utils.improc.preprocess_color(rgbs[0:1]), dim=1),
+                                   valids=valids[0:1], cmap='winter', only_return=True))
+        sw.summ_traj2ds_on_rgb('outputs/single_trajs_on_gt_rgb', trajs_e[0:1] - pad, gt_rgb[0:1], cmap='spring')
+
+    return trajs_e - pad, vis_e
+
+
 def train():
     # model save path
     # model_path = 'checkpoints/01_8_64_32_1e-4_p1_avg_trajs_20:44:39.pth'  # where the ckpt is
@@ -407,13 +428,12 @@ def train():
 
     # actual coeffs
     coeff_prob = 1.0
+    B = 1
+    S = 8
 
     ## autogen a name
-    exp_name = 'traj_estimation'
+    exp_name = 'mlp_evaluation'
     model_name = "%02d_%d_%d" % (B, S, N)
-    lrn = "%.1e" % lr  # e.g., 5.0e-04
-    lrn = lrn[0] + lrn[3:5] + lrn[-1]  # e.g., 5e-4
-    model_name += "_%s" % lrn
     all_coeffs = [
         coeff_prob,
     ]
@@ -423,8 +443,6 @@ def train():
     for l_, l in enumerate(all_coeffs):
         if l > 0:
             model_name += "_%s%s" % (all_prefixes[l_], utils.basic.strnum(l))
-    if use_augs:
-        model_name += "_A"
     model_name += "_%s" % exp_name
 
     import datetime
@@ -432,66 +450,29 @@ def train():
     model_name = model_name + '_' + model_date + '_' + model_name_suffix
     print('model_name', model_name)
 
-    writer_t = SummaryWriter(log_dir + '/' + model_name + '/t', max_queue=10, flush_secs=60)
-    if do_val:
-        writer_v = SummaryWriter(log_dir + '/' + model_name + '/v', max_queue=10, flush_secs=60)
+    writer_p = SummaryWriter(log_dir + '/' + model_name + '/p', max_queue=10, flush_secs=60)
+    writer_v = SummaryWriter(log_dir + '/' + model_name + '/v', max_queue=10, flush_secs=60)
 
     def worker_init_fn(worker_id):
         np.random.seed(np.random.get_state()[1][0] + worker_id)
 
-    train_dataset = flyingthingsdataset.FlyingThingsDataset(
-        dset='TRAIN', subset='all',
-        use_augs=use_augs,
-        N=N, S=S,
-        crop_size=crop_size)
+    print('not using augs in val')
 
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=B,
-        shuffle=shuffle,
-        num_workers=num_worker,
-        worker_init_fn=worker_init_fn,
-        drop_last=True)
-    train_iterloader = iter(train_dataloader)
-
-    if cache:
-        print('we will cache %d' % cache_len)
-        sample_pool = utils.misc.SimplePool(cache_len, version='np')
-
-    if do_val:
-        print('not using augs in val')
-        val_dataset = flyingthingsdataset.FlyingThingsDataset(dset='TEST', subset='all',
-                                                              use_augs=False, N=N, S=S, crop_size=crop_size,
-                                                              )
-        val_dataloader = DataLoader(
+    sample_num = 2542
+    val_dataset = crohddataset.CrohdDataset(seqlen=8, dset='t')
+    val_dataloader = DataLoader(
             val_dataset,
             batch_size=1,
             shuffle=False,
             num_workers=12,
-            pin_memory= True)
-        val_iterloader = iter(val_dataloader)
+            pin_memory=True)
+    val_iterloader = iter(val_dataloader)
 
     global_step = 0
 
-    n_pool = 100
-    loss_pool_t = utils.misc.SimplePool(n_pool, version='np')
-    frac_01_pool_t = utils.misc.SimplePool(n_pool, version='np')
-    frac_005_pool_t = utils.misc.SimplePool(n_pool, version='np')
-    frac_001_pool_t = utils.misc.SimplePool(n_pool, version='np')
-    frac_0_pool_t = utils.misc.SimplePool(n_pool, version='np')
-
-    avg_error_pool_t = utils.misc.SimplePool(n_pool, version='np')
-
-    n_pool_v = 10
-    if do_val:
-        loss_pool_v = utils.misc.SimplePool(n_pool_v, version='np')
-        frac_01_pool_v = utils.misc.SimplePool(n_pool_v, version='np')
-        frac_005_pool_v = utils.misc.SimplePool(n_pool_v, version='np')
-        frac_001_pool_v = utils.misc.SimplePool(n_pool_v, version='np')
-        frac_0_pool_v = utils.misc.SimplePool(n_pool_v, version='np')
-        avg_error_pool_v = utils.misc.SimplePool(n_pool, version='np')
-
-    total_loss = torch.tensor(0.0, requires_grad=True).to(device)
+    n_pool_v = 5000
+    avg_error_pool_p = utils.misc.SimplePool(n_pool_v, version='np')
+    avg_error_pool_v = utils.misc.SimplePool(n_pool_v, version='np')
 
     model = MLP(in_dim=S * (3 * num_band + 3) + 2 * feature_map_dim + (S-1) * (2 * num_band + 2) + S,
                 out_dim=S * 3,
@@ -505,130 +486,37 @@ def train():
     encoder = encoder.to(device)
     encoder = torch.nn.DataParallel(encoder, device_ids=device_ids)
 
+    saverloader.load(ckpt_dir, model, optimizer=None, scheduler=None, model_ema=None, step=0, model_name='model',
+                     ignore_load=None)
+    saverloader.load(ckpt_dir, encoder, optimizer=None, scheduler=None, model_ema=None, step=0, model_name='encoder',
+                     ignore_load=None)
+
     pips = Pips(stride=4).cuda()
     saverloader.load(init_dir, pips)
     pips.eval()
 
-    if use_ckpt:
-
-        saverloader.load(ckpt_dir, model, optimizer=None, scheduler=None, model_ema=None, step=0, model_name='model',
-                         ignore_load=None)
-        saverloader.load(ckpt_dir, encoder, optimizer=None, scheduler=None, model_ema=None, step=0, model_name='encoder',
-                         ignore_load=None)
-
+    total_error_p = 0
+    total_error_v = 0
 
     criterion = nn.L1Loss()
-    optimizer = optim.AdamW([
-        {'params': model.parameters(), 'lr': lr},
-        {'params': encoder.parameters(), 'lr': lr}
-    ])
 
-    while global_step < max_iters:
+    with torch.no_grad():
+        while global_step < sample_num:
 
-        model = model.train()
+            read_start_time = time.time()
+            global_step += 1
 
-        read_start_time = time.time()
-        global_step += 1
-
-        sw_t = utils.improc.Summ_writer(
-            writer=writer_t,
-            global_step=global_step,
-            log_freq=log_freq,
-            fps=5,
-            scalar_freq=2,
-            just_gif=True)
-
-        if cache:
-            if (global_step) % cache_freq == 0:
-                sample_pool.empty()
-
-            if len(sample_pool) < cache_len:
-                print('caching a new sample')
-                try:
-                    sample = next(train_iterloader)
-                except StopIteration:
-                    train_iterloader = iter(train_dataloader)
-                    sample = next(train_iterloader)
-                sample['rgbs'] = sample['rgbs'].cpu().detach().numpy()
-                sample['masks'] = sample['masks'].cpu().detach().numpy()
-                sample_pool.update([sample])
-            else:
-                sample = sample_pool.sample()
-        else:
-            try:
-                sample = next(train_iterloader)
-            except StopIteration:
-                train_iterloader = iter(train_dataloader)
-                sample = next(train_iterloader)
-            sample['rgbs'] = sample['rgbs'].cpu().detach().numpy()
-            sample['masks'] = sample['masks'].cpu().detach().numpy()
-
-        rgbs = torch.from_numpy(sample['rgbs']).cuda().float()  # B, S, C, H, W
-
-        # ground truth trajs
-        # trajs = sample['trajs'].cuda().float()  # B, S, N, 2
-
-        valids = sample['valids'].cuda().float()  # B, S, N
-        rgbs = torch.from_numpy(sample['rgbs']).cuda().float()  # B, S, C, H, W
-        trajs = sample['trajs'].cuda().float()  # B, S, N, 2
-
-        '''
-        train process
-        '''
-
-        read_time = time.time() - read_start_time
-        iter_start_time = time.time()
-
-        optimizer.zero_grad()
-
-        trajs_e, vis_e = run_pips(pips, rgbs, N, sw_t)  # N-2
-
-        N0 = trajs.shape[2]
-        target_idx = int(torch.randint(0, N0 - 1, (1,)))
-        target_traj = trajs[:, :, target_idx:target_idx+1, :]  # B, S, 1, 2
-
-        total_loss, frac_supporters_scaler, avg_error, _ = run_model(model, encoder, rgbs, trajs_e, target_traj,
-                                                                     vis_e, criterion, sw_t)
-
-        total_loss.backward()
-        optimizer.step()
-
-        sw_t.summ_scalar('total_loss', total_loss)
-        loss_pool_t.update([total_loss.detach().cpu().numpy()])
-        sw_t.summ_scalar('pooled/total_loss', loss_pool_t.mean())
-
-        sw_t.summ_scalar('average_error', avg_error)
-        avg_error_pool_t.update([avg_error.detach().cpu().numpy()])
-        sw_t.summ_scalar('pooled/average_error', avg_error_pool_t.mean())
-
-
-        '''
-        fraction of supporters: visualization
-        '''
-        frac_supporters_01 = frac_supporters_scaler[0]
-        if frac_supporters_01 is None:
-            continue
-
-        frac_supporters_005 = frac_supporters_scaler[1]
-        frac_supporters_001 = frac_supporters_scaler[2]
-        supporter_num = frac_supporters_scaler[3]
-
-        total_pt_num = (N - 1) * S
-
-        frac_01_pool_t.update([frac_supporters_01 / total_pt_num])
-        frac_005_pool_t.update([frac_supporters_005 / total_pt_num])
-        frac_001_pool_t.update([frac_supporters_001 / total_pt_num])
-        frac_0_pool_t.update([supporter_num / total_pt_num])
-
-        sw_t.summ_scalar('outputs/percent_of_supporters/thres=0.1', 100 * frac_01_pool_t.mean())
-        sw_t.summ_scalar('outputs/percent_of_supporters/thres=0.05', 100 * frac_005_pool_t.mean())
-        sw_t.summ_scalar('outputs/percent_of_supporters/thres=0.01', 100 * frac_001_pool_t.mean())
-        sw_t.summ_scalar('outputs/percent_of_supporters/thres=0', 100 * frac_0_pool_t.mean())
-
-        if do_val and (global_step) % val_freq == 0:
             torch.cuda.empty_cache()
             # let's do a val iter
-            model.eval()
+
+            sw_p = utils.improc.Summ_writer(
+                writer=writer_p,
+                global_step=global_step,
+                log_freq=log_freq,
+                fps=5,
+                scalar_freq=2,
+                just_gif=True)
+
             sw_v = utils.improc.Summ_writer(
                 writer=writer_v,
                 global_step=global_step,
@@ -636,6 +524,7 @@ def train():
                 fps=5,
                 scalar_freq=2,
                 just_gif=True)
+
             try:
                 sample = next(val_iterloader)
             except StopIteration:
@@ -643,74 +532,70 @@ def train():
                 sample = next(val_iterloader)
 
             sample['rgbs'] = sample['rgbs'].cpu().detach().numpy()
-            rgbs = torch.from_numpy(sample['rgbs']).cuda().float()  # B, S, C, H, W
-            valids = sample['valids'].cuda().float()  # B, S, N
 
-            with torch.no_grad():
-                trajs_e, vis_e = run_pips(pips, rgbs, N, sw_t)
+            rgbs = torch.from_numpy(sample['rgbs']).cuda().float().permute(0, 1, 4, 2, 3)  # B, S, C, H, W
 
-                target_traj = trajs_e[:, :, 0:1, :]  # B, S, 1, 2
-                trajs_e = trajs_e[:, :, 1:, :]  # B, S, N0, 2
-                vis_e = vis_e[:, :, 1:]
+            B, S, C, H, W = rgbs.shape
+            rgbs_ = rgbs.reshape(B * S, C, H, W)
+            H_, W_ = crop_size  # 360, 640
+            rgbs_ = F.interpolate(rgbs_, (H_, W_), mode='bilinear')
+            rgbs = rgbs_.reshape(B, S, C, H_, W_)
 
-                total_loss, frac_supporters_scaler, avg_error, _ = run_model(model, encoder, rgbs, trajs_e, target_traj,
-                                                                             vis_e, criterion, sw_v)
-            sw_v.summ_scalar('total_loss', total_loss)
-            loss_pool_v.update([total_loss.detach().cpu().numpy()])
-            sw_v.summ_scalar('pooled/total_loss', loss_pool_v.mean())
+            trajs = sample['xylist'].cuda().float()  # B, S, N, 2
+            trajs[:, :, :, 0] = trajs[:, :, :, 0] /H * H_
+            trajs[:, :, :, 0] = trajs[:, :, :, 0] /W * W_
 
-            sw_v.summ_scalar('average_error', avg_error)
-            avg_error_pool_v.update([avg_error.detach().cpu().numpy()])
+            valids = sample['vislist'].cuda().float()  # B, S, N
+
+            read_time = time.time() - read_start_time
+            iter_start_time = time.time()
+
+            '''
+            pips evaluation
+            '''
+            N0 = trajs.shape[2]
+            target_idx = torch.randint(0, N0 - 1, (1,))
+            target_idx = int(target_idx)
+            target_traj = trajs[:, :, target_idx:target_idx + 1, :]  # B, S, 1, 2
+
+            trajs_e, vis_e = run_pips_eval(pips, target_traj, rgbs, valids, sw_p)
+
+            avg_error_p = torch.norm((trajs_e-target_traj), 2, dim=-1)
+            avg_error_p = torch.mean(avg_error_p)
+
+            sw_p.summ_scalar('average_error', avg_error_p)
+            avg_error_pool_p.update([avg_error_p.detach().cpu().numpy()])
+            sw_p.summ_scalar('pooled/average_error', avg_error_pool_p.mean())
+
+            total_error_p += avg_error_p.detach().cpu().numpy()
+            sw_p.summ_scalar('pooled/total_error', total_error_p)
+
+            '''
+            our model evaluation
+            '''
+
+            trajs_e, vis_e = run_pips(pips, rgbs, N, sw_v)  # N-2
+
+            total_loss, frac_supporters_scaler, avg_error_v, _ = run_model(model, encoder, rgbs, trajs_e, target_traj,
+                                                                           vis_e, criterion, sw_v)
+
+            sw_v.summ_scalar('average_error', avg_error_v)
+            avg_error_pool_v.update([avg_error_v.detach().cpu().numpy()])
             sw_v.summ_scalar('pooled/average_error', avg_error_pool_v.mean())
 
-            frac_supporters_01 = frac_supporters_scaler[0]
-            if frac_supporters_01 is None:
-                continue
+            total_error_v += avg_error_v.detach().cpu().numpy()
+            sw_v.summ_scalar('pooled/total_error', total_error_v)
 
-            frac_supporters_005 = frac_supporters_scaler[1]
-            frac_supporters_001 = frac_supporters_scaler[2]
-            supporter_num = frac_supporters_scaler[3]
+            iter_time = time.time() - iter_start_time
+            print('%s; step %06d/%d; rtime %.2f; itime %.2f; pips_error = %.5f; mlp_error = %.5f' % (
+                model_name, global_step, sample_num, read_time, iter_time,
+                avg_error_p.item(), avg_error_v.item()))
 
-            total_pt_num = (N - 1) * S
-
-            frac_01_pool_v.update([frac_supporters_01 / total_pt_num])
-            frac_005_pool_v.update([frac_supporters_005 / total_pt_num])
-            frac_001_pool_v.update([frac_supporters_001 / total_pt_num])
-            frac_0_pool_v.update([supporter_num / total_pt_num])
-
-            sw_t.summ_scalar('outputs/percent_of_supporters/thres=0.1', 100 * frac_01_pool_v.mean())
-            sw_t.summ_scalar('outputs/percent_of_supporters/thres=0.05', 100 * frac_005_pool_v.mean())
-            sw_t.summ_scalar('outputs/percent_of_supporters/thres=0.01', 100 * frac_001_pool_v.mean())
-            sw_t.summ_scalar('outputs/percent_of_supporters/thres=0', 100 * frac_0_pool_v.mean())
-
-        iter_time = time.time() - iter_start_time
-        print('%s; step %06d/%d; rtime %.2f; itime %.2f; loss = %.5f' % (
-            model_name, global_step, max_iters, read_time, iter_time,
-            total_loss.item()))
-
-        if not global_step % save_freq:
-            saverloader.save(ckpt_dir, optimizer, encoder, global_step, model_name='encoder')
-            saverloader.save(ckpt_dir, optimizer, model, global_step, model_name='model')
-
-    writer_t.close()
-    if do_val:
-        writer_v.close()
+    writer_p.close()
+    writer_v.close()
 
 
 if __name__ == '__main__':
     # init argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--max_iters', type=int, help='iteration numbers',
-                        default=20000)
-    parser.add_argument('--use_cache', type=bool, help='whether to use cache in training;',
-                        default=False)
-    parser.add_argument('--cache_len', type=int, help='cache len',
-                        default=100)
-    args = parser.parse_args()
-
-    cache = args.use_cache
-    max_iters = args.max_iters
-    cache_len = args.cache_len
 
     train()
