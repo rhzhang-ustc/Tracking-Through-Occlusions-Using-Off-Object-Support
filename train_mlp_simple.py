@@ -227,13 +227,13 @@ def run_model(embedding_mlp,
         votes_embedding = pred[:, :, :-1]
         aggregate_votes_embedding = torch.sum(votes_embedding * norm_w, dim=-2).reshape(B, 1, -1)   # B, 1, embedding_dim
 
-        xy = xy_mlp(aggregate_votes_embedding)  # B, 1, 2
-        supporters_xy = xy_mlp(votes_embedding)     # B, N0, 2
-
         '''
         update target feature
         '''
         target_embedding, h = GRU(aggregate_votes_embedding, h)
+
+        xy = xy_mlp(target_embedding)  # B, 1, 2
+        supporters_xy = xy_mlp(votes_embedding)     # B, N0, 2
 
         pred_traj[:, s, :, :] = xy
 
