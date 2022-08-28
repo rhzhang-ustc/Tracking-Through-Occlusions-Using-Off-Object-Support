@@ -42,13 +42,13 @@ np.random.seed(125)
 B = 1
 S = 8
 N = 256 + 1  # we need to load at least 4 i think
-lr = 1e-4
+lr = 1e-5
 grad_acc = 1
 
 crop_size = (368, 496)
 
 max_iters = 10000
-log_freq = 1
+log_freq = 1000
 save_freq = 5000
 shuffle = True
 do_val = True
@@ -169,7 +169,6 @@ def run_model(embedding_mlp,
     B, S, C, H, W = rgbs.shape
     _, _, N0, _ = trajs.shape
 
-    frame_lst = []  # for visualization
     pred_traj = torch.zeros(B, S, 1, 2).cuda()
 
     frame_features_map = encoder(rgbs.reshape(B * S, C, H, W)).reshape(B, S, feature_map_dim,
@@ -193,13 +192,13 @@ def run_model(embedding_mlp,
                                    torch.ones(B, 1, 1).cuda(),
                                    target_frame_feature,
                                    ], dim=-1)
-    target_feature = embedding_mlp(target_feature)  # B, 1, 1024
+    target_embedding = embedding_mlp(target_feature)  # B, 1, 1024
 
     '''
     get supporters' feature
     '''
 
-    h = torch.zeros((B, 1, embedding_dim)).cuda()
+    h = target_embedding.clone().detach().requires_grad_(True)
 
     for s in range(S):
 
@@ -217,27 +216,30 @@ def run_model(embedding_mlp,
                                                 pos[:, :, 1] / encoder_stride).permute(0, 2, 1)  # B, N0, 128
 
         supporters_features = torch.concat([pos_encoding, motion_encoding, valids[:, s, :, None], features], dim=-1)
-        supporters_features = embedding_mlp(supporters_features)
 
-        pred = voting_mlp(torch.concat([supporters_features, target_feature.repeat(1, N0, 1)], dim=-1))  # B, N0, embedding_dim+1
+        supporters_embedding = embedding_mlp(supporters_features)
 
-        xy = xy_mlp(pred[:, :, 0:-1])  # B, N0, 2
+        pred = voting_mlp(torch.concat([supporters_embedding, target_embedding.repeat(1, N0, 1)], dim=-1))  # B, N0, embedding_dim+1
 
         w = pred[:, :, -1:]  # B, N0, 1  weight for vote that begins at start point
         norm_w = torch.softmax(w, dim=1)  # B, N0, 1
 
-        pred_traj_s = torch.sum(norm_w * xy, dim=1).reshape(B, 1, 2)  # B, 1, 2
+        votes_embedding = pred[:, :, :-1]
+        aggregate_votes_embedding = torch.sum(votes_embedding * norm_w, dim=-2).reshape(B, 1, -1)   # B, 1, embedding_dim
+
+        xy = xy_mlp(aggregate_votes_embedding)  # B, 1, 2
+        supporters_xy = xy_mlp(votes_embedding)     # B, N0, 2
 
         '''
         update target feature
         '''
-        target_feature, h = GRU(target_feature, h)
+        target_embedding, h = GRU(aggregate_votes_embedding, h)
 
-        pred_traj[:, s, :, :] = pred_traj_s
+        pred_traj[:, s, :, :] = xy
 
         target_traj_s = target_traj[:, s, :, :]  # B, 1, 2
 
-        total_loss = total_loss + criterion(pred_traj_s, target_traj_s)
+        total_loss = total_loss + criterion(xy, target_traj_s)
 
         '''
         additional loss: force topk points to have reasonable result
@@ -249,7 +251,7 @@ def run_model(embedding_mlp,
             k_temp = len(norm_w)
             _, top_k_index = torch.topk(norm_w, k_temp, dim=1)  # B, 100, 1
 
-        pred_matrix = xy.index_select(1, top_k_index[0, :, 0])
+        pred_matrix = supporters_xy.index_select(1, top_k_index[0, :, 0])
 
         # more easy way
         if k > k_temp:
