@@ -85,6 +85,7 @@ class FlyingThingsDataset(torch.utils.data.Dataset):
     def __init__(self, dataset_location='../../aharley/flyingthings', dset='TRAIN', subset='all', use_augs=False, N=0, S=4, crop_size=(368, 496), version='ad', occ_version='al', force_twice_vis=True, N_min=None):
 
         print('loading FlyingThingsDataset...')
+
         
         self.S = S
         self.N = N
@@ -679,6 +680,632 @@ class FlyingThingsDataset(torch.utils.data.Dataset):
             
         return rgbs, occs, masks, trajs
     
+    def __len__(self):
+        # return 10
+        return len(self.rgb_paths)
+
+
+class FlyingThingsZigzagDataset(torch.utils.data.Dataset):
+    def __init__(self, dataset_location='../../aharley/flyingthings', dset='TRAIN', subset='all', use_augs=False, N=0, S=8,
+                 S_out=32, crop_size=(368, 496), version='ad', occ_version='al', force_double_inb=False, force_all_inb=False):
+
+        self.S = S
+        self.S_out = S_out
+        self.N = N
+
+        self.use_augs = use_augs
+
+        self.force_double_inb = force_double_inb
+        self.force_all_inb = force_all_inb
+
+        self.rgb_paths = []
+        self.traj_paths = []
+        self.mask_paths = []
+        self.flow_f_paths = []
+        self.flow_b_paths = []
+        self.start_inds = []
+        self.load_fails = []
+
+        self.subset = subset
+
+        if self.subset == 'all':
+            subsets = ['A', 'B', 'C']
+        else:
+            subsets = [subset]
+
+        for subset in subsets:
+            rgb_root_path = os.path.join(dataset_location, "frames_cleanpass_webp", dset, subset)
+            flow_root_path = os.path.join(dataset_location, "optical_flow", dset, subset)
+            traj_root_path = os.path.join(dataset_location, "trajs_%s" % version, dset, subset)
+            mask_root_path = os.path.join(dataset_location, "object_index", dset, subset)
+            # heavy_root_path = os.path.join(dataset_location, "heavy_raft_flows_ab", dset, subset)
+
+            folder_names = [folder.split('/')[-1] for folder in glob.glob(os.path.join(traj_root_path, "*"))]
+            folder_names = sorted(folder_names)
+            # print('first 10 folders only')
+            # folder_names = folder_names[:10]
+            # print('folder_names', folder_names)
+
+            for ii, folder_name in enumerate(folder_names):
+                for lr in ['left', 'right']:
+                    cur_rgb_path = os.path.join(rgb_root_path, folder_name, lr)
+                    cur_traj_path = os.path.join(traj_root_path, folder_name, lr)
+                    cur_mask_path = os.path.join(mask_root_path, folder_name, lr)
+
+                    for start_ind in [0, 1, 2, 3]:
+                        traj_fn = cur_traj_path + '/trajs_at_%d.npz' % start_ind
+                        if os.path.isfile(traj_fn):
+                            file_size = os.path.getsize(traj_fn)
+                            if file_size > 1000:  # the empty ones are 264 bytes
+                                # trajs = np.load(os.path.join(cur_traj_path, 'trajs_at_%d.npz' % start_ind), allow_pickle=True)
+                                # trajs = dict(trajs)['trajs'] # S,N,2
+                                # S, N, D = trajs.shape
+                                # if N >= self.N:
+                                #     # print('adding this one')
+                                #     self.rgb_paths.append(cur_rgb_path)
+                                #     self.traj_paths.append(cur_traj_path)
+                                #     self.mask_paths.append(cur_mask_path)
+                                #     self.start_inds.append(start_ind)
+                                #     self.load_fails.append(0)
+                                #     sys.stdout.write('.')
+                                #     sys.stdout.flush()
+                                # else:
+                                #     sys.stdout.write('l')
+                                #     sys.stdout.flush()
+
+                                self.rgb_paths.append(cur_rgb_path)
+                                self.traj_paths.append(cur_traj_path)
+                                self.mask_paths.append(cur_mask_path)
+                                self.start_inds.append(start_ind)
+                                self.load_fails.append(0)
+                                sys.stdout.write('.')
+                                sys.stdout.flush()
+
+                # if ii > 10 and (ii % 100)==0:
+                #     # print('found %d samples in %s so far...' % (len(self.rgb_paths), dataset_location))
+                #     sys.stdout.write('%.1f%%' % (100*(ii+1)/len(folder_names)))
+                #     sys.stdout.flush()
+        # print('%.1f%%' % (100*(ii+1)/len(folder_names)))
+        print('found %d samples in %s (dset=%s, subset=%s, version=%s)' % (
+        len(self.rgb_paths), dataset_location, dset, self.subset, version))
+
+        # we also need to step through and collect ooccluder info
+        print('loading occluders...')
+
+        self.occ_rgb_paths = []
+        self.occ_mask_paths = []
+        self.occ_start_inds = []
+        self.occ_traj_paths = []
+
+        # print('locking start_ind=0, for speed')
+        for subset in subsets:
+            # print('sub')
+            # print(subset*10)
+
+            rgb_root_path = os.path.join(dataset_location, "frames_cleanpass_webp", dset, subset)
+            flow_root_path = os.path.join(dataset_location, "optical_flow", dset, subset)
+            mask_root_path = os.path.join(dataset_location, "object_index", dset, subset)
+            occ_root_path = os.path.join(dataset_location, "occluders_%s" % occ_version, dset, subset)
+
+            # print('occ_root_path', occ_root_path)
+
+            folder_names = [folder.split('/')[-1] for folder in glob.glob(os.path.join(occ_root_path, "*"))]
+            folder_names = sorted(folder_names)
+            # print('folder_names', folder_names)
+            # print('first 10 folders only')
+            # folder_names = folder_names[:10]
+
+            # print('folder_names', folder_names)
+
+            # for ii, folder_name in enumerate(folder_names):
+            for folder_name in folder_names:
+
+                for lr in ['left', 'right']:
+
+                    cur_rgb_path = os.path.join(rgb_root_path, folder_name, lr)
+                    cur_mask_path = os.path.join(mask_root_path, folder_name, lr)
+                    cur_occ_path = os.path.join(occ_root_path, folder_name, lr)
+
+                    # start_ind = 0
+                    # if True:
+                    for start_ind in [0, 1, 2]:
+                        occ_fn = cur_occ_path + '/occluder_at_%d.npy' % (start_ind)
+
+                        # print("occ_fn', occ_fn')
+                        # # file_names = glob.glob(os.path.join(cur_occ_path, "*at_%d.npz" % start_ind))
+                        # file_names = glob.glob(os.path.join(cur_occ_path, "*at_%d.npy" % start_ind))
+                        # print('file_names', file_names)
+                        # print('len', len(file_names))
+                        # # input()
+
+                        # for ii in range(len(file_names)):
+                        if os.path.isfile(occ_fn):
+                            file_size = os.path.getsize(occ_fn)
+                            if file_size > 1000:  # the empty ones are 10 bytes
+
+                                # print('file_size', file_size)
+
+                                # occ_info = np.load(occ_fn, allow_pickle=True)
+                                # occ_info = dict(occ_info)
+                                # occ_trajs = occ_info['trajs'] # S,N,2, or None
+                                # occ_id = occ_info['id_'] # []
+                                # print('occ_trajs', occ_trajs.shape)
+
+                                self.occ_rgb_paths.append(cur_rgb_path)
+                                self.occ_mask_paths.append(cur_mask_path)
+                                self.occ_start_inds.append(start_ind)
+                                self.occ_traj_paths.append(occ_fn)
+                                # print('adding something')
+
+                        sys.stdout.write('.')
+                        sys.stdout.flush()
+
+                # if ii > 10 and (ii % 100)==0:
+                #     # print('found %d samples in %s so far...' % (len(self.rgb_paths), dataset_location))
+                #     sys.stdout.write('%.1f%%' % (100*(ii+1)/len(folder_names)))
+                #     sys.stdout.flush()
+        # print('%.1f%%' % (100*(ii+1)/len(folder_names)))
+        print('found %d occluders in %s (dset=%s, subset=%s, version=%s)' % (
+        len(self.occ_rgb_paths), dataset_location, dset, self.subset, occ_version))
+
+        # print('self.occ_rgb_paths', self.occ_rgb_paths[:5])
+        # print('self.occ_traj_paths', self.occ_traj_paths[:5])
+
+        # photometric augmentation
+        # self.photo_aug = ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.5/3.14)
+        self.photo_aug = ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.25 / 3.14)
+        self.blur_aug = GaussianBlur(11, sigma=(0.1, 2.0))
+        self.asymmetric_color_aug_prob = 0.2
+
+        self.blur_aug_prob = 0.2
+        self.color_aug_prob = 0.5
+
+        # occlusion augmentation
+        self.eraser_aug_prob = 0.1
+        self.eraser_bounds = [20, 300]
+
+        # spatial augmentations
+        self.crop_size = crop_size
+        self.min_scale = -0.1  # 2^this
+        self.max_scale = 1.0  # 2^this
+        # self.resize_lim = [0.8, 1.2]
+        self.resize_aug_prob = 0.8
+
+        # spatial augmentations
+        self.crop_aug_prob = 0.5
+        self.max_crop_offset = 10
+
+        self.spatial_aug_prob = 0.8
+        self.stretch_prob = 0.2
+        self.max_stretch = 0.2
+        self.do_flip = False
+        self.h_flip_prob = 0.5
+        self.v_flip_prob = 0.5
+
+        # zig zag setup
+        self.zigzag_step_max = min(self.S, 5)
+        self.zigzag_step_min = 2
+        self.switch_dir_prob = 0
+        self.max_crop_offset = 20
+
+    def __getitem__(self, index):
+        gotit = False
+        while not gotit:
+            cur_rgb_path = self.rgb_paths[index]
+            cur_traj_path = self.traj_paths[index]
+            cur_mask_path = self.mask_paths[index]
+            # cur_heavy_path = self.heavy_paths[index]
+            # cur_flow_f_path = self.flow_f_paths[index]
+            # cur_flow_b_path = self.flow_b_paths[index]
+            # print('cur_rgb_path', cur_rgb_path)
+
+            img_names = [folder.split('/')[-1].split('.')[0] for folder in glob.glob(os.path.join(cur_rgb_path, "*"))]
+            img_names = sorted(img_names)
+
+            start_ind = 0
+            img_names = img_names[start_ind:start_ind + self.S]
+
+            rgbs = []
+            masks = []
+            flows_f = []
+            flows_b = []
+
+            # orig_rgbs = []
+            # orig_trajs = []
+
+            for img_name in img_names:
+                # im = Image.open(os.path.join(cur_rgb_path, '{0}.webp'.format(img_name))) # H, W, 3
+                with Image.open(os.path.join(cur_rgb_path, '{0}.webp'.format(img_name))) as im:
+                    rgbs.append(np.array(im))
+
+                # print('rgb', rgbs[-1].shape)
+                # print('cur_mask_path', cur_mask_path)
+                mask = readImage(os.path.join(cur_mask_path, '{0}.pfm'.format(img_name)))
+                # print('%s mask' % img_name, mask.shape)
+                masks.append(mask)
+
+            trajs = np.load(os.path.join(cur_traj_path, 'trajs_at_%d.npz' % start_ind), allow_pickle=True)
+            trajs = dict(trajs)['trajs']  # S, N, 2
+
+            # heavy = np.load(os.path.join(cur_heavy_path, 'traj.npz'), allow_pickle=True)
+            # heavy = dict(heavy)
+            # trajs_XYs = heavy['trajs_XYs']
+            # trajs_Ts = heavy['trajs_Ts']
+
+            # print('trajs_XYs[0]', trajs_XYs[0], trajs_XYs[0].shape)
+            # print('trajs_Ts[0]', trajs_Ts[0], trajs_Ts[0].shape)
+
+            try:
+                S_, N_, D_ = trajs.shape
+            except ValueError:
+                index += 1
+                continue
+
+            assert (N_ >= self.N)
+            assert (S_ >= self.S)
+
+            trajs = trajs[:self.S, :]
+            # print('trajs', trajs.shape)
+
+            orig_rgbs = torch.from_numpy(np.stack(rgbs, 0)).permute(0, 3, 1, 2).clone()  # S, C, H, W
+            orig_trajs = torch.from_numpy(trajs)  # S, N, 2
+
+            if self.use_augs:
+                success = False
+                for _ in range(5):
+                    rgbs_aug, masks_aug, trajs_aug, visibles_aug, inbound = self.zigzag_augment(rgbs, masks, trajs)
+
+                    try:
+                        N_ = trajs_aug.shape[1]
+                        if N_ >= self.N:
+                            success = True
+                        break
+                    except:
+                        continue
+                rgbs, masks, trajs, visibles = rgbs_aug, masks_aug, trajs_aug, visibles_aug
+                if trajs.shape[1] < self.N:
+                    return self.__getitem__(np.random.choice(self.__len__()))
+            else:
+                for _ in range(5):
+                    rgbs_crop, masks_crop, trajs_crop, visibles_crop, inbound = self.zigzag_just_crop(rgbs, masks,
+                                                                                                      trajs)
+                    try:
+                        N_ = trajs_crop.shape[1]
+                        if N_ >= self.N:
+                            success = True
+                        break
+                    except:
+                        continue
+                rgbs, masks, trajs, visibles = rgbs_crop, masks_crop, trajs_crop, visibles_crop
+
+            orig_trajs = orig_trajs[:, inbound]
+
+            N_ = min(trajs.shape[1], self.N)
+            traj_id = np.random.choice(trajs.shape[1], size=N_, replace=False)
+            # trajs = trajs[traj_id] # N, S, 2
+
+            trajs_full = np.zeros((self.S_out, self.N, 2)).astype(np.float32)
+            valids = np.zeros((self.N)).astype(np.float32)
+            trajs_full[:, :N_] = trajs[:, traj_id]
+            valids[:N_] = 1
+            visibles = visibles[:, traj_id]
+
+            orig_trajs = orig_trajs[:, traj_id]
+
+            rgbs = torch.from_numpy(np.stack(rgbs, 0)).permute(0, 3, 1, 2)  # S, C, H, W
+            masks = torch.from_numpy(np.stack(masks, 0)).unsqueeze(1)  # S, 1, H, W
+            trajs = torch.from_numpy(trajs_full)  # S, N, 2
+            valids = torch.from_numpy(valids)  # N
+            visibles = torch.from_numpy(visibles)   # S, N
+
+            if torch.sum(valids) == self.N:
+                gotit = True
+            else:
+                # print('re-indexing...')
+                index = np.random.randint(0, len(self.rgb_paths))
+
+        # print('torch.sum(valids)', torch.sum(valids))
+        return_dict = {
+            # 'cur_heavy_path': cur_heavy_path,
+            'orig_rgbs': orig_rgbs,
+            'orig_trajs': orig_trajs,
+            'rgbs': rgbs,
+            'masks': masks,
+            'trajs': trajs,
+            # 'trajs_XYs': [trajs_XYs],
+            # 'trajs_Ts': [trajs_Ts],
+            'valids': valids,
+            'visibles': visibles,
+        }
+        return return_dict
+
+    def zigzag_augment(self, rgbs, masks, trajs):
+        '''
+        Input:
+            rgbs --- list of len S, each = np.array (H, W, 3)
+            trajs --- np.array (S, N, 2)
+        Output:
+            rgbs_aug --- np.array (S_out, H, W, 3)
+            trajs_aug --- np.array (S_out, N_new, 2)
+            visibles_aug --- np.array (S_out, N_new)
+        '''
+
+        T, N, _ = trajs.shape
+        visibles = np.ones((T, N))
+
+        S = len(rgbs)
+        H, W = rgbs[0].shape[:2]
+
+        ############ create a zig zag sequence ############=
+        rgbs_zigzag = []
+        masks_zigzag = []
+        trajs_zigzag = []
+        cur_index = 0
+        direction = 1
+
+        while len(rgbs_zigzag) < self.S_out:
+            # steps to go
+            num_steps = np.random.randint(low=self.zigzag_step_min, high=self.zigzag_step_max + 1)
+            num_steps = min(num_steps, self.S_out - len(rgbs_zigzag))
+
+            # whether to change direction
+            if np.random.rand() < self.switch_dir_prob:
+                direction *= -1
+
+            # we start at the current location (inclusive) and add frames sequentially
+            for _ in range(num_steps):
+                rgbs_zigzag.append(rgbs[cur_index])
+                masks_zigzag.append(masks[cur_index])
+                trajs_zigzag.append(trajs[cur_index])
+
+                cur_index += direction
+
+                # if this got too small (means we were at 0, and now at -1), let's bounce back the direction
+                # and set cur_index to 1
+                if cur_index == -1:
+                    direction = 1
+                    cur_index = 1
+
+                # if this got too large (means we were at S-1, and now at S), let's bounce back the direction
+                # and set cur_index to S-2
+                if cur_index == S:
+                    direction = -1
+                    cur_index = S - 2
+
+        rgbs = rgbs_zigzag
+        masks = masks_zigzag
+        trajs = np.stack(trajs_zigzag, axis=0)
+
+        T, N, _ = trajs.shape
+        visibles = np.ones((T, N))
+        S = len(rgbs)
+        H, W = rgbs[0].shape[:2]
+
+        ############ photometric augmentation ############
+        if np.random.rand() < self.asymmetric_color_aug_prob:
+            for i in range(S):
+                rgbs[i] = np.array(self.photo_aug(Image.fromarray(rgbs[i])), dtype=np.uint8)
+        else:
+            rgbs = [np.array(self.photo_aug(Image.fromarray(rgb)), dtype=np.uint8) for rgb in rgbs]
+
+        ############ eraser transform (per image) ############
+        for i in range(1, S):
+            if np.random.rand() < self.eraser_aug_prob:
+                mean_color = np.mean(rgbs[i].reshape(-1, 3), axis=0)
+                for _ in range(np.random.randint(1, 6)):
+                    xc = np.random.randint(0, W)
+                    yc = np.random.randint(0, H)
+                    dx = np.random.randint(self.eraser_bounds[0], self.eraser_bounds[1])
+                    dy = np.random.randint(self.eraser_bounds[0], self.eraser_bounds[1])
+                    x0 = np.clip(xc - dx / 2, 0, W - 1).round().astype(np.int32)
+                    x1 = np.clip(xc + dx / 2, 0, W - 1).round().astype(np.int32)
+                    y0 = np.clip(yc - dy / 2, 0, W - 1).round().astype(np.int32)
+                    y1 = np.clip(yc + dy / 2, 0, W - 1).round().astype(np.int32)
+                    # print(x0, x1, y0, y1)
+                    rgbs[i][y0:y1, x0:x1, :] = mean_color
+
+                    occ_inds = np.logical_and(np.logical_and(trajs[i, :, 0] >= x0, trajs[i, :, 0] < x1),
+                                              np.logical_and(trajs[i, :, 1] >= y0, trajs[i, :, 1] < y1))
+                    visibles[i, occ_inds] = 0
+
+        ############ spatial transform ############
+        # scaling + stretching
+        scale_x = 1.0
+        scale_y = 1.0
+        H_new = H
+        W_new = W
+        if np.random.rand() < self.spatial_aug_prob:
+            # print('spat')
+            min_scale = np.maximum(
+                (self.crop_size[0] + 8) / float(H),
+                (self.crop_size[1] + 8) / float(W))
+
+            scale = 2 ** np.random.uniform(self.min_scale, self.max_scale)
+            scale_x = scale
+            scale_y = scale
+
+            if np.random.rand() < self.stretch_prob:
+                # print('stretch')
+                scale_x *= 2 ** np.random.uniform(-self.max_stretch, self.max_stretch)
+                scale_y *= 2 ** np.random.uniform(-self.max_stretch, self.max_stretch)
+
+            scale_x = np.clip(scale_x, min_scale, None)
+            scale_y = np.clip(scale_y, min_scale, None)
+
+            H_new = int(H * scale_y)
+            W_new = int(W * scale_x)
+            # dim_resize = (W_new, H_new * S)
+            rgbs = [cv2.resize(rgb, (W_new, H_new), interpolation=cv2.INTER_LINEAR) for rgb in rgbs]
+            masks = [cv2.resize(mask, (W_new, H_new), interpolation=cv2.INTER_LINEAR) for mask in masks]
+
+        trajs[:, :, 0] *= scale_x
+        trajs[:, :, 1] *= scale_y
+
+        # flip
+        h_flipped = False
+        v_flipped = False
+        if self.do_flip:
+            # h flip
+            if np.random.rand() < self.h_flip_prob:
+                # print('h flip')
+                h_flipped = True
+                rgbs = [rgb[:, ::-1] for rgb in rgbs]
+                masks = [mask[:, ::-1] for mask in masks]
+            # v flip
+            if np.random.rand() < self.v_flip_prob:
+                # print('v flip')
+                v_flipped = True
+                rgbs = [rgb[::-1] for rgb in rgbs]
+                masks = [mask[::-1] for mask in masks]
+        if h_flipped:
+            trajs[:, :, 0] = W_new - trajs[:, :, 0]
+        if v_flipped:
+            trajs[:, :, 1] = H_new - trajs[:, :, 1]
+
+        y0 = np.random.randint(0, H_new - self.crop_size[0])
+        x0 = np.random.randint(0, W_new - self.crop_size[1])
+        for s in range(S):
+            if s > 0:
+                x0 = x0 + np.random.randint(-self.max_crop_offset, self.max_crop_offset + 1)
+                y0 = y0 + np.random.randint(-self.max_crop_offset, self.max_crop_offset + 1)
+            y0 = min(max(0, y0), H_new - self.crop_size[0] - 1)
+            x0 = min(max(0, x0), W_new - self.crop_size[1] - 1)
+            rgbs[s] = rgbs[s][y0:y0 + self.crop_size[0], x0:x0 + self.crop_size[1]]
+            masks[s] = masks[s][y0:y0 + self.crop_size[0], x0:x0 + self.crop_size[1]]
+            trajs[s, :, 0] -= x0
+            trajs[s, :, 1] -= y0
+        # print('-')
+
+        if self.force_double_inb:
+            inbound0 = (trajs[0, :, 0] >= 0) & (trajs[0, :, 0] <= self.crop_size[1] - 1) & (trajs[0, :, 1] >= 0) & (
+                        trajs[0, :, 1] <= self.crop_size[0] - 1)
+            inbound1 = (trajs[1, :, 0] >= 0) & (trajs[1, :, 0] <= self.crop_size[1] - 1) & (trajs[1, :, 1] >= 0) & (
+                        trajs[1, :, 1] <= self.crop_size[0] - 1)
+            inbound = inbound0 & inbound1
+        elif self.force_all_inb:
+            inbound = (trajs[0, :, 0] >= 0) & (trajs[0, :, 0] <= self.crop_size[1] - 1) & (trajs[0, :, 1] >= 0) & (
+                        trajs[0, :, 1] <= self.crop_size[0] - 1)
+            for s in range(1, S):
+                inboundi = (trajs[s, :, 0] >= 0) & (trajs[s, :, 0] <= self.crop_size[1] - 1) & (trajs[s, :, 1] >= 0) & (
+                        trajs[s, :, 1] <= self.crop_size[0] - 1)
+                inbound = inbound & inboundi
+        else:
+            inbound = (trajs[0, :, 0] >= 0) & (trajs[0, :, 0] <= self.crop_size[1] - 1) & (trajs[0, :, 1] >= 0) & (
+                        trajs[0, :, 1] <= self.crop_size[0] - 1)
+
+        trajs = trajs[:, inbound]
+        visibles = visibles[:, inbound]
+        # mark oob points as invisible
+        for i in range(1, S):
+            oob_inds = np.logical_or(np.logical_or(trajs[i, :, 0] < 0, trajs[i, :, 0] > self.crop_size[1] - 1),
+                                     np.logical_or(trajs[i, :, 1] < 0, trajs[i, :, 1] > self.crop_size[0] - 1))
+            visibles[i, oob_inds] = 0
+
+        return rgbs, masks, trajs, visibles, inbound
+
+    def zigzag_just_crop(self, rgbs, masks, trajs):
+        '''
+        Input:
+            rgbs --- list of len S, each = np.array (H, W, 3)
+            trajs --- np.array (N, S, 2)
+        Output:
+            rgbs_aug --- np.array (S_out, H, W, 3)
+            trajs_aug --- np.array (N_new, S_out, 2)
+            visibles_aug --- np.array (N_new, S_out)
+        '''
+
+        N, T, _ = trajs.shape
+        visibles = np.ones((N, T))
+
+        S = len(rgbs)
+        H, W = rgbs[0].shape[:2]
+
+        ############ create a zig zag sequence ############=
+        rgbs_zigzag = []
+        masks_zigzag = []
+        trajs_zigzag = []
+        cur_index = 0
+        direction = 1
+
+        while len(rgbs_zigzag) < self.S_out:
+            # steps to go
+            num_steps = np.random.randint(low=self.zigzag_step_min, high=self.zigzag_step_max + 1)
+            num_steps = min(num_steps, self.S_out - len(rgbs_zigzag))
+
+            # whether to change direction
+            if np.random.rand() < self.switch_dir_prob:
+                direction *= -1
+
+            # we start at the current location (inclusive) and add frames sequentially
+            for _ in range(num_steps):
+                rgbs_zigzag.append(rgbs[cur_index])
+                masks_zigzag.append(masks[cur_index])
+                trajs_zigzag.append(trajs[:, cur_index])
+
+                cur_index += direction
+
+                # if this got too small (means we were at 0, and now at -1), let's bounce back the direction
+                # and set cur_index to 1
+                if cur_index == -1:
+                    direction = 1
+                    cur_index = 1
+
+                # if this got too large (means we were at S-1, and now at S), let's bounce back the direction
+                # and set cur_index to S-2
+                if cur_index == S:
+                    direction = -1
+                    cur_index = S - 2
+
+        rgbs = rgbs_zigzag
+        masks = masks_zigzag
+        trajs = np.stack(trajs_zigzag, axis=1)
+
+        N, T, _ = trajs.shape
+        visibles = np.ones((N, T))
+        S = len(rgbs)
+        H, W = rgbs[0].shape[:2]
+
+        ############ spatial transform ############
+        H_new = H
+        W_new = W
+
+        y0 = np.random.randint(0, H_new - self.crop_size[0])
+        x0 = np.random.randint(0, W_new - self.crop_size[1])
+
+        rgbs = [rgb[y0:y0 + self.crop_size[0], x0:x0 + self.crop_size[1]] for rgb in rgbs]
+        masks = [mask[y0:y0 + self.crop_size[0], x0:x0 + self.crop_size[1]] for mask in masks]
+        trajs[:, :, 0] -= x0
+        trajs[:, :, 1] -= y0
+
+        # inbound = (trajs[:,0,0] >= 0) & (trajs[:,0,0] <= self.crop_size[1]-1) & (trajs[:,0,1] >= 0) & (trajs[:,0,1] <= self.crop_size[0]-1)
+        if self.force_double_inb:
+            inbound0 = (trajs[:, 0, 0] >= 0) & (trajs[:, 0, 0] <= self.crop_size[1] - 1) & (trajs[:, 0, 1] >= 0) & (
+                        trajs[:, 0, 1] <= self.crop_size[0] - 1)
+            inbound1 = (trajs[:, 1, 0] >= 0) & (trajs[:, 1, 0] <= self.crop_size[1] - 1) & (trajs[:, 1, 1] >= 0) & (
+                        trajs[:, 1, 1] <= self.crop_size[0] - 1)
+            inbound = inbound0 & inbound1
+        elif self.force_all_inb:
+            inbound = (trajs[:, 0, 0] >= 0) & (trajs[:, 0, 0] <= self.crop_size[1] - 1) & (trajs[:, 0, 1] >= 0) & (
+                        trajs[:, 0, 1] <= self.crop_size[0] - 1)
+            for s in range(1, S):
+                inboundi = (trajs[:, s, 0] >= 0) & (trajs[:, s, 0] <= self.crop_size[1] - 1) & (trajs[:, s, 1] >= 0) & (
+                            trajs[:, s, 1] <= self.crop_size[0] - 1)
+                inbound = inbound & inboundi
+        else:
+            inbound = (trajs[:, 0, 0] >= 0) & (trajs[:, 0, 0] <= self.crop_size[1] - 1) & (trajs[:, 0, 1] >= 0) & (
+                        trajs[:, 0, 1] <= self.crop_size[0] - 1)
+
+        trajs = trajs[inbound]
+        visibles = visibles[inbound]
+
+        # mark oob points as invisible
+        for i in range(1, S):
+            oob_inds = np.logical_or(np.logical_or(trajs[:, i, 0] < 0, trajs[:, i, 0] > self.crop_size[1] - 1),
+                                     np.logical_or(trajs[:, i, 1] < 0, trajs[:, i, 1] > self.crop_size[0] - 1))
+            visibles[oob_inds, i] = 0
+
+        return rgbs, masks, trajs, visibles, inbound
+
     def __len__(self):
         # return 10
         return len(self.rgb_paths)
