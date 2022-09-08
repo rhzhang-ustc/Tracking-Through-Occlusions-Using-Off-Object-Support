@@ -27,7 +27,7 @@ import re
 import sys
 
 from torchvision.transforms import ColorJitter, GaussianBlur
-
+import copy
 
 np.random.seed(125)
 torch.multiprocessing.set_sharing_strategy('file_system')
@@ -82,7 +82,19 @@ def readImage(name):
 
 
 class FlyingThingsDataset(torch.utils.data.Dataset):
-    def __init__(self, dataset_location='../../aharley/flyingthings', dset='TRAIN', subset='all', use_augs=False, N=0, S=4, crop_size=(368, 496), version='ad', occ_version='al', force_twice_vis=True, N_min=None):
+    def __init__(self,
+                 dataset_location='../../aharley/flyingthings',
+                 dset='TRAIN',
+                 subset='all',
+                 use_augs=False,
+                 zigzag=False,
+                 N=0, S=8,
+                 S_out=8,
+                 crop_size=(368, 496),
+                 version='ad',
+                 occ_version='al',
+                 force_twice_vis=True,
+                 N_min=None):
 
         print('loading FlyingThingsDataset...')
 
@@ -95,7 +107,9 @@ class FlyingThingsDataset(torch.utils.data.Dataset):
             self.N_min = N_min
             
         self.use_augs = use_augs
-        
+        self.zigzag = zigzag
+        self.S_out = S_out
+
         self.rgb_paths = []
         self.traj_paths = []
         self.mask_paths = []
@@ -283,6 +297,12 @@ class FlyingThingsDataset(torch.utils.data.Dataset):
         self.h_flip_prob = 0.5
         self.v_flip_prob = 0.5
 
+        self.switch_dir_prob = 0.3
+        # zig zag setup
+        self.zigzag_step_max = min(self.S, 5)
+        self.zigzag_step_min = 2
+
+
     def getitem_helper(self, index):
         sample = None
         gotit = False
@@ -321,7 +341,9 @@ class FlyingThingsDataset(torch.utils.data.Dataset):
         # the data we loaded is all visible
         visibles = np.ones((S, N))
 
-        # print('rgbs[0]', rgbs[0].shape)
+        if self.zigzag or self.S_out > self.S:
+            rgbs, masks, trajs, visibles, valids= self.add_zigzag(rgbs, masks, trajs, visibles, valids)
+
         rgbs, occs, masks, trajs, visibles, valids = self.add_occluders(rgbs, masks, trajs, visibles, valids)
 
         # print('occ rgbs[0]', rgbs[0].shape)
@@ -369,9 +391,9 @@ class FlyingThingsDataset(torch.utils.data.Dataset):
         # inds = utils.py.farthest_point_sample(trajs[0], N_, deterministic=False)
         inds = np.random.choice(trajs.shape[1], N_, replace=False)
 
-        trajs_full = np.zeros((self.S, self.N, 2)).astype(np.float32)
-        visibles_full = np.zeros((self.S, self.N)).astype(np.float32)
-        valids_full = np.zeros((self.S, self.N)).astype(np.float32)
+        trajs_full = np.zeros((self.S_out, self.N, 2)).astype(np.float32)
+        visibles_full = np.zeros((self.S_out, self.N)).astype(np.float32)
+        valids_full = np.zeros((self.S_out, self.N)).astype(np.float32)
         # valids = np.zeros((self.N)).astype(np.float32)
         trajs_full[:,:N_] = trajs[:,inds]
         visibles_full[:,:N_] = visibles[:,inds]
@@ -414,7 +436,7 @@ class FlyingThingsDataset(torch.utils.data.Dataset):
                     load_fail = self.load_fails[index]
 
         return sample
-    
+
     def add_occluders(self, rgbs, masks, trajs, visibles, valids):
         '''
         Input:
@@ -433,6 +455,7 @@ class FlyingThingsDataset(torch.utils.data.Dataset):
         
         S = len(rgbs)
         H, W = rgbs[0].shape[:2]
+
         assert(S==T)
 
         # rgbs = [0.1*rgb.astype(np.float32) for rgb in rgbs]
@@ -462,27 +485,127 @@ class FlyingThingsDataset(torch.utils.data.Dataset):
             occ_info = np.load(occ_traj_path, allow_pickle=True).item()
             id_str = list(occ_info.keys())[np.random.choice(len(occ_info))]
             alt_trajs = occ_info[id_str] # S,N,2, with often N==0
+
             occ_id = int(id_str)
-            
-            alt_visibles = np.ones_like(alt_trajs[:,:,0]) # S,N
-            alt_valids = np.ones_like(alt_trajs[:,:,0]) # S,N
 
             alt_rgbs = []
             alt_masks = []
             alt_masks_blur = []
+
             for img_name in img_names:
                 with Image.open(os.path.join(occ_rgb_path, '{0}.webp'.format(img_name))) as im:
                     alt_rgbs.append(np.array(im))
                 mask = readImage(os.path.join(occ_mask_path, '{0}.pfm'.format(img_name)))
                 mask = (mask==occ_id).astype(np.float32)
                 # mask_  = np.clip(cv2.GaussianBlur(mask,(3,3),0) + mask, 0,1).reshape(H, W, 1) # widen slightly, but keep all the important pixels
-                mask_blur  = np.clip(cv2.GaussianBlur(mask,(3,3),0), 0,1).reshape(H, W, 1)
+                mask_blur = np.clip(cv2.GaussianBlur(mask,(3,3),0), 0,1).reshape(H, W, 1)
                 alt_masks.append(mask)#.reshape(H, W, 1))
                 alt_masks_blur.append(mask_blur)#.reshape(H, W, 1))
 
+            '''
+            check whether this occluder is legal
+            '''
+
+            legal_thres = 0.2
+
+            try:
+                if np.sum(alt_masks[0]) / np.sum(alt_masks[1]) < legal_thres \
+                        or np.sum(alt_masks[-1]) / np.sum(alt_masks[-2]) < legal_thres:
+                    continue
+            except ZeroDivisionError:
+                continue
+
+            '''
+            try to make occluders appear randomly at different timestep
+            however, in this implementation it's hard to detect illegal appearance & disappearance
+            and trajs will be noisy, as some points on the occluders can never be tracked during the disappearance time
+            '''
+
+            # # set visibles = 0 and change it to 1 only the occluders are added to the frame
+            # alt_visibles = np.zeros((self.S_out, alt_trajs.shape[1]))  # S,N
+            # alt_valids = np.ones((self.S_out, alt_trajs.shape[1]))  # S,N
+            #
+            # # if the occluder is right, we decide when it should appear and how many times it appear
+            # alt_rgbs_extend = []
+            # alt_masks_extend = []
+            # alt_masks_blur_extend = []
+            #
+            # # repeat times and when they begin
+            # # occ_repeat_num = 1 means the occluder only shows up once
+            # occ_repeat_num = int(np.random.randint(low=1, high=int(self.S_out // self.S), size=(1, )))
+            # occ_new_start_ind = np.random.choice(self.S_out, occ_repeat_num, replace=False)
+            #
+            # blank_frame = np.zeros((H, W))
+            # blank_frame_3d = np.zeros((H, W, 3))
+            # blank_traj = -1 * np.ones((1, alt_trajs.shape[1], 2))
+            #
+            # alt_trajs_extend = []
+            #
+            # for repeat_idx in range(occ_repeat_num):
+            #
+            #     alt_visibles[occ_new_start_ind[repeat_idx]:occ_new_start_ind[repeat_idx]+self.S] = 1
+            #
+            #     alt_rgbs_extend.extend([blank_frame_3d for _ in range(occ_new_start_ind[repeat_idx])])
+            #     alt_rgbs_extend.extend(alt_rgbs)
+            #
+            #     alt_masks_extend.extend([blank_frame for _ in range(occ_new_start_ind[repeat_idx])])
+            #     alt_masks_extend.extend(alt_masks)
+            #
+            #     alt_masks_blur_extend.extend([blank_frame for _ in range(occ_new_start_ind[repeat_idx])])
+            #     alt_masks_blur_extend.extend(alt_masks_blur)
+            #
+            #     alt_trajs_extend.extend([blank_traj for _ in range(occ_new_start_ind[repeat_idx])])
+            #     alt_trajs_extend.append(alt_trajs)
+            #
+            # padding_frame_num = self.S_out - len(alt_masks_extend)
+            #
+            # if padding_frame_num > 0:
+            #     alt_rgbs_extend.extend([blank_frame_3d for _ in range(padding_frame_num)])
+            #     alt_masks_extend.extend([blank_frame for _ in range(padding_frame_num)])
+            #     alt_masks_blur_extend.extend([blank_frame for _ in range(padding_frame_num)])
+            #     alt_trajs_extend.extend([blank_traj for _ in range(padding_frame_num)])
+            #
+            # alt_rgbs = alt_rgbs_extend[:self.S_out]
+            # alt_masks = alt_masks_extend[:self.S_out]
+            # alt_masks_blur = alt_masks_blur_extend[:self.S_out]
+            #
+            # alt_trajs_extend = np.concatenate(alt_trajs_extend, axis=0)
+            # alt_trajs = alt_trajs_extend[:self.S_out]
+
+            '''
+            so i use simple forward & backward movement for the occluders
+            '''
+
+            alt_rgbs_extend = []
+            alt_masks_extend = []
+            alt_masks_blur_extend = []
+            alt_trajs_extend = []
+
+            alt_visibles = np.ones((self.S_out, alt_trajs.shape[1]))  # S,N
+            alt_valids = np.ones((self.S_out, alt_trajs.shape[1]))  # S,N
+
+            for _ in range(self.S_out // self.S):
+                alt_rgbs_extend.extend(alt_rgbs)
+                alt_masks_extend.extend(alt_masks)
+                alt_masks_blur_extend.extend(alt_masks_blur)
+                alt_trajs_extend.extend(alt_trajs)
+
+                alt_rgbs.reverse()
+                alt_masks_extend.reverse()
+                alt_masks_blur_extend.reverse()
+                alt_trajs = alt_trajs[::-1]
+
+            alt_rgbs = alt_rgbs_extend
+            alt_masks = alt_masks_extend
+            alt_masks_blur = alt_masks_blur_extend
+            alt_trajs = np.stack(alt_trajs_extend, axis=0)
+
+            '''we can test random appearing version by commenting codes up there '''
+
             rgbs = [rgb*(1.0-alt_mask.reshape(H,W,1))+alt_rgb*alt_mask.reshape(H,W,1) for (rgb,alt_rgb,alt_mask) in zip(rgbs,alt_rgbs,alt_masks_blur)]
             # occs = [np.clip(occ+alt_mask, 0,1) for (occ,alt_mask) in zip(occs,alt_masks)]
-            occs = [occ+alt_mask for (occ,alt_mask) in zip(occs,alt_masks)]
+
+            occs = [occ+alt_mask for (occ, alt_mask) in zip(occs, alt_masks)]
 
             # # darken the non-occluder, for debug
             # rgbs = [rgb*(1.0-(alt_mask*0.5)) for (rgb,alt_rgb,alt_mask) in zip(rgbs,alt_rgbs,alt_masks)]
@@ -498,15 +621,78 @@ class FlyingThingsDataset(torch.utils.data.Dataset):
                 y_ = y.clip(0, H-1)
                 inds = (alt_masks[s][y_,x_] == 1) & (x >= 0) & (x <= W-1) & (y >= 0) & (y <= H-1)
                 # inds = np.logical_and(np.logical_and( >= x0, trajs[i,:,0] < x1), np.logical_and(trajs[i,:,1] >= y0, trajs[i,:,1] < y1))
-                visibles[s,inds] = 0
+                visibles[s, inds] = 0
 
             rgbs = [rgb.astype(np.uint8) for rgb in rgbs]
-
             trajs = np.concatenate([trajs, alt_trajs], axis=1)
             visibles = np.concatenate([visibles, alt_visibles], axis=1)
             valids = np.concatenate([valids, alt_valids], axis=1)
 
         return rgbs, occs, masks, trajs, visibles, valids
+
+    def add_zigzag(self, rgbs, masks, trajs, visibles, valids):
+        '''
+               Input:
+                   rgbs --- list of len S, each = np.array (H, W, 3)
+                   trajs --- np.array (S, N, 2)
+               Output:
+                   rgbs --- np.array (S_out, H, W, 3)
+                   trajs --- np.array (S_out, N_new,  2)
+                   visibles --- np.array (S_out, N_new)
+               '''
+
+        T, N, _ = trajs.shape
+
+        S = len(rgbs)
+        H, W = rgbs[0].shape[:2]
+
+        ############ create a zig zag sequence ############=
+        rgbs_zigzag = []
+        masks_zigzag = []
+        trajs_zigzag = []
+        visibles_zigzag = []
+        valids_zigzag = []
+        cur_index = 0
+        direction = 1
+
+        while len(rgbs_zigzag) < self.S_out:
+            # steps to go
+            num_steps = np.random.randint(low=self.zigzag_step_min, high=self.zigzag_step_max + 1)
+            num_steps = min(num_steps, self.S_out - len(rgbs_zigzag))
+
+            # whether to change direction
+            if np.random.rand() < self.switch_dir_prob:
+                direction *= -1
+
+            # we start at the current location (inclusive) and add frames sequentially
+            for _ in range(num_steps):
+                rgbs_zigzag.append(rgbs[cur_index])
+                masks_zigzag.append(masks[cur_index])
+                trajs_zigzag.append(trajs[cur_index])
+                visibles_zigzag.append(visibles[cur_index])
+                valids_zigzag.append(valids[cur_index])
+
+                cur_index += direction
+
+                # if this got too small (means we were at 0, and now at -1), let's bounce back the direction
+                # and set cur_index to 1
+                if cur_index == -1:
+                    direction = 1
+                    cur_index = 1
+
+                # if this got too large (means we were at S-1, and now at S), let's bounce back the direction
+                # and set cur_index to S-2
+                if cur_index == S:
+                    direction = -1
+                    cur_index = S - 2
+
+        rgbs = rgbs_zigzag
+        masks = masks_zigzag
+        trajs = np.stack(trajs_zigzag, axis=0)
+        visibles = np.stack(visibles_zigzag, axis=0)
+        valids = np.stack(valids_zigzag, axis=0)
+
+        return rgbs, masks, trajs, visibles, valids
 
     def add_photometric_augs(self, rgbs, trajs, visibles):
         T, N, _ = trajs.shape
