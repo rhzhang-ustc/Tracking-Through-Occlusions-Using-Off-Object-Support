@@ -506,101 +506,46 @@ class FlyingThingsDataset(torch.utils.data.Dataset):
             check whether this occluder is legal
             '''
 
-            legal_thres = 0.2
+            if not np.sum(alt_masks[0]) and not np.sum(alt_masks[-1]):
 
-            try:
-                if np.sum(alt_masks[0]) / (np.sum(alt_masks[1]) + 0.1) < legal_thres \
-                        or np.sum(alt_masks[-1]) / (np.sum(alt_masks[-2]) + 0.1) < legal_thres:
-                    continue
-            except ZeroDivisionError:
-                continue
+                occ_repeat_num = int(np.random.randint(low=1, high=int(self.S_out // self.S), size=(1, )))
+                occ_new_start_ind = np.random.choice(self.S_out, occ_repeat_num, replace=False)
 
-            '''
-            try to make occluders appear randomly at different timestep
-            however, in this implementation it's hard to detect illegal appearance & disappearance
-            and trajs will be noisy, as some points on the occluders can never be tracked during the disappearance time
-            '''
+                blank_frame = np.zeros((H, W))
+                blank_frame_3d = np.zeros((H, W, 3))
 
-            # # set visibles = 0 and change it to 1 only the occluders are added to the frame
-            # alt_visibles = np.zeros((self.S_out, alt_trajs.shape[1]))  # S,N
-            # alt_valids = np.ones((self.S_out, alt_trajs.shape[1]))  # S,N
-            #
-            # # if the occluder is right, we decide when it should appear and how many times it appear
-            # alt_rgbs_extend = []
-            # alt_masks_extend = []
-            # alt_masks_blur_extend = []
-            #
-            # # repeat times and when they begin
-            # # occ_repeat_num = 1 means the occluder only shows up once
-            # occ_repeat_num = int(np.random.randint(low=1, high=int(self.S_out // self.S), size=(1, )))
-            # occ_new_start_ind = np.random.choice(self.S_out, occ_repeat_num, replace=False)
-            #
-            # blank_frame = np.zeros((H, W))
-            # blank_frame_3d = np.zeros((H, W, 3))
-            # blank_traj = -1 * np.ones((1, alt_trajs.shape[1], 2))
-            #
-            # alt_trajs_extend = []
-            #
-            # for repeat_idx in range(occ_repeat_num):
-            #
-            #     alt_visibles[occ_new_start_ind[repeat_idx]:occ_new_start_ind[repeat_idx]+self.S] = 1
-            #
-            #     alt_rgbs_extend.extend([blank_frame_3d for _ in range(occ_new_start_ind[repeat_idx])])
-            #     alt_rgbs_extend.extend(alt_rgbs)
-            #
-            #     alt_masks_extend.extend([blank_frame for _ in range(occ_new_start_ind[repeat_idx])])
-            #     alt_masks_extend.extend(alt_masks)
-            #
-            #     alt_masks_blur_extend.extend([blank_frame for _ in range(occ_new_start_ind[repeat_idx])])
-            #     alt_masks_blur_extend.extend(alt_masks_blur)
-            #
-            #     alt_trajs_extend.extend([blank_traj for _ in range(occ_new_start_ind[repeat_idx])])
-            #     alt_trajs_extend.append(alt_trajs)
-            #
-            # padding_frame_num = self.S_out - len(alt_masks_extend)
-            #
-            # if padding_frame_num > 0:
-            #     alt_rgbs_extend.extend([blank_frame_3d for _ in range(padding_frame_num)])
-            #     alt_masks_extend.extend([blank_frame for _ in range(padding_frame_num)])
-            #     alt_masks_blur_extend.extend([blank_frame for _ in range(padding_frame_num)])
-            #     alt_trajs_extend.extend([blank_traj for _ in range(padding_frame_num)])
-            #
-            # alt_rgbs = alt_rgbs_extend[:self.S_out]
-            # alt_masks = alt_masks_extend[:self.S_out]
-            # alt_masks_blur = alt_masks_blur_extend[:self.S_out]
-            #
-            # alt_trajs_extend = np.concatenate(alt_trajs_extend, axis=0)
-            # alt_trajs = alt_trajs_extend[:self.S_out]
+                alt_rgbs_extend = [blank_frame_3d for _ in range(self.S_out)]
+                alt_masks_extend = [blank_frame for _ in range(self.S_out)]
+                alt_masks_blur_extend = [blank_frame for _ in range(self.S_out)]
 
-            '''
-            so i use simple forward & backward movement for the occluders
-            '''
+                for repeat_idx in range(occ_repeat_num):
 
-            alt_rgbs_extend = []
-            alt_masks_extend = []
-            alt_masks_blur_extend = []
-            alt_trajs_extend = []
+                    end_idx = np.min([occ_new_start_ind[repeat_idx] + self.S, self.S_out])
+                    time_span = np.min([self.S, end_idx - occ_new_start_ind[repeat_idx]])
 
-            alt_visibles = np.ones((self.S_out, alt_trajs.shape[1]))  # S,N
-            alt_valids = np.ones((self.S_out, alt_trajs.shape[1]))  # S,N
+                    alt_rgbs_extend[occ_new_start_ind[repeat_idx]:end_idx] = alt_rgbs[:time_span]
+                    alt_masks_extend[occ_new_start_ind[repeat_idx]:end_idx] = alt_masks[:time_span]
+                    alt_masks_blur_extend[occ_new_start_ind[repeat_idx]:end_idx] = alt_masks_blur[:time_span]
 
-            for _ in range(self.S_out // self.S):
-                alt_rgbs_extend.extend(alt_rgbs)
-                alt_masks_extend.extend(alt_masks)
-                alt_masks_blur_extend.extend(alt_masks_blur)
-                alt_trajs_extend.extend(alt_trajs)
+            else:
 
-                alt_rgbs.reverse()
-                alt_masks.reverse()
-                alt_masks_blur.reverse()
-                alt_trajs = alt_trajs[::-1]
+                alt_rgbs_extend = []
+                alt_masks_extend = []
+                alt_masks_blur_extend = []
 
-            alt_rgbs = alt_rgbs_extend
-            alt_masks = alt_masks_extend
-            alt_masks_blur = alt_masks_blur_extend
-            alt_trajs = np.stack(alt_trajs_extend, axis=0)
+                for _ in range(self.S_out // self.S + 1):
+                    alt_rgbs_extend.extend(alt_rgbs)
+                    alt_masks_extend.extend(alt_masks)
+                    alt_masks_blur_extend.extend(alt_masks_blur)
 
-            '''we can test random appearing version by commenting codes up there '''
+                    alt_rgbs.reverse()
+                    alt_masks.reverse()
+                    alt_masks_blur.reverse()
+                    alt_trajs = alt_trajs[::-1]
+
+            alt_rgbs = alt_rgbs_extend[:self.S_out]
+            alt_masks = alt_masks_extend[:self.S_out]
+            alt_masks_blur = alt_masks_blur_extend[:self.S_out]
 
             rgbs = [rgb*(1.0-alt_mask.reshape(H,W,1))+alt_rgb*alt_mask.reshape(H,W,1) for (rgb,alt_rgb,alt_mask) in zip(rgbs,alt_rgbs,alt_masks_blur)]
             # occs = [np.clip(occ+alt_mask, 0,1) for (occ,alt_mask) in zip(occs,alt_masks)]
@@ -624,9 +569,6 @@ class FlyingThingsDataset(torch.utils.data.Dataset):
                 visibles[s, inds] = 0
 
             rgbs = [rgb.astype(np.uint8) for rgb in rgbs]
-            trajs = np.concatenate([trajs, alt_trajs], axis=1)
-            visibles = np.concatenate([visibles, alt_visibles], axis=1)
-            valids = np.concatenate([valids, alt_valids], axis=1)
 
         return rgbs, occs, masks, trajs, visibles, valids
 
