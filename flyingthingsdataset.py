@@ -509,8 +509,8 @@ class FlyingThingsDataset(torch.utils.data.Dataset):
             legal_thres = 0.2
 
             try:
-                if np.sum(alt_masks[0]) / np.sum(alt_masks[1]) < legal_thres \
-                        or np.sum(alt_masks[-1]) / np.sum(alt_masks[-2]) < legal_thres:
+                if np.sum(alt_masks[0]) / (np.sum(alt_masks[1]) + 0.1) < legal_thres \
+                        or np.sum(alt_masks[-1]) / (np.sum(alt_masks[-2]) + 0.1) < legal_thres:
                     continue
             except ZeroDivisionError:
                 continue
@@ -591,8 +591,8 @@ class FlyingThingsDataset(torch.utils.data.Dataset):
                 alt_trajs_extend.extend(alt_trajs)
 
                 alt_rgbs.reverse()
-                alt_masks_extend.reverse()
-                alt_masks_blur_extend.reverse()
+                alt_masks.reverse()
+                alt_masks_blur.reverse()
                 alt_trajs = alt_trajs[::-1]
 
             alt_rgbs = alt_rgbs_extend
