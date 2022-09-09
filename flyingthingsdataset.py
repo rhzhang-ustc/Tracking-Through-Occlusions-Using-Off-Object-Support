@@ -502,6 +502,10 @@ class FlyingThingsDataset(torch.utils.data.Dataset):
                 alt_masks.append(mask)#.reshape(H, W, 1))
                 alt_masks_blur.append(mask_blur)#.reshape(H, W, 1))
 
+            alt_visibles = np.ones((self.S_out, alt_trajs.shape[1]))
+            alt_valids = np.ones((self.S_out, alt_trajs.shape[1]))
+            alt_trajs_extend = []
+
             '''
             check whether this occluder is legal
             '''
@@ -523,9 +527,9 @@ class FlyingThingsDataset(torch.utils.data.Dataset):
                     end_idx = np.min([occ_new_start_ind[repeat_idx] + self.S, self.S_out])
                     time_span = np.min([self.S, end_idx - occ_new_start_ind[repeat_idx]])
 
-                    alt_rgbs_extend[occ_new_start_ind[repeat_idx]:end_idx] = alt_rgbs[:time_span]
-                    alt_masks_extend[occ_new_start_ind[repeat_idx]:end_idx] = alt_masks[:time_span]
-                    alt_masks_blur_extend[occ_new_start_ind[repeat_idx]:end_idx] = alt_masks_blur[:time_span]
+                    alt_rgbs_extend[occ_new_start_ind[repeat_idx]:end_idx] += alt_rgbs[:time_span]
+                    alt_masks_extend[occ_new_start_ind[repeat_idx]:end_idx] += alt_masks[:time_span]
+                    alt_masks_blur_extend[occ_new_start_ind[repeat_idx]:end_idx] += alt_masks_blur[:time_span]
 
             else:
 
@@ -533,15 +537,38 @@ class FlyingThingsDataset(torch.utils.data.Dataset):
                 alt_masks_extend = []
                 alt_masks_blur_extend = []
 
-                for _ in range(self.S_out // self.S + 1):
-                    alt_rgbs_extend.extend(alt_rgbs)
-                    alt_masks_extend.extend(alt_masks)
-                    alt_masks_blur_extend.extend(alt_masks_blur)
+                direction = 1
+                cur_index = 0
 
-                    alt_rgbs.reverse()
-                    alt_masks.reverse()
-                    alt_masks_blur.reverse()
-                    alt_trajs = alt_trajs[::-1]
+                while len(alt_rgbs_extend) < self.S_out:
+                    # steps to go
+                    num_steps = np.random.randint(low=self.zigzag_step_min, high=self.zigzag_step_max + 1)
+                    num_steps = min(num_steps, self.S_out - len(alt_rgbs_extend))
+
+                    # whether to change direction
+                    if np.random.rand() < self.switch_dir_prob:
+                        direction *= -1
+
+                    # we start at the current location (inclusive) and add frames sequentially
+                    for _ in range(num_steps):
+                        alt_rgbs_extend.append(alt_rgbs[cur_index])
+                        alt_masks_extend.append(alt_masks[cur_index])
+                        alt_masks_blur_extend.append(alt_masks_blur[cur_index])
+                        alt_trajs_extend.append(alt_trajs[cur_index])
+
+                        cur_index += direction
+
+                        # if this got too small (means we were at 0, and now at -1), let's bounce back the direction
+                        # and set cur_index to 1
+                        if cur_index == -1:
+                            direction = 1
+                            cur_index = 1
+
+                        # if this got too large (means we were at S-1, and now at S), let's bounce back the direction
+                        # and set cur_index to S-2
+                        if cur_index == self.S:
+                            direction = -1
+                            cur_index = self.S - 2
 
             alt_rgbs = alt_rgbs_extend[:self.S_out]
             alt_masks = alt_masks_extend[:self.S_out]
@@ -569,6 +596,12 @@ class FlyingThingsDataset(torch.utils.data.Dataset):
                 visibles[s, inds] = 0
 
             rgbs = [rgb.astype(np.uint8) for rgb in rgbs]
+
+            if len(alt_trajs_extend):
+                alt_trajs = np.stack(alt_trajs_extend[:self.S_out], axis=0)
+                trajs = np.concatenate([trajs, alt_trajs], axis=1)
+                valids = np.concatenate([valids, alt_valids], axis=1)
+                visibles = np.concatenate([visibles, alt_visibles], axis=1)
 
         return rgbs, occs, masks, trajs, visibles, valids
 
