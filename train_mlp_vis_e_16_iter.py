@@ -44,7 +44,7 @@ S = 8
 S_interval = 4
 S_out = 16
 
-N = 64 + 1  # we need to load at least 4 i think
+N = 16 + 1  # we need to load at least 4 i think
 lr = 1e-4
 grad_acc = 1
 
@@ -59,7 +59,7 @@ do_val = False
 iters = 2
 
 cache = True
-cache_len = 100
+cache_len = 10
 cache_freq = 99999999
 use_augs = True
 
@@ -84,8 +84,8 @@ alpha = 1
 init_dir = 'reference_model'
 
 log_dir = 'test_logs'
-model_name_suffix = 'mutual_16_iter'
-ckpt_dir = 'checkpoints_mutual_16_iter'
+model_name_suffix = 'mutual_16_iter2_cache'
+ckpt_dir = 'checkpoints_mutual_16_iter2_cache'
 num_worker = 12
 
 use_ckpt = False
@@ -261,7 +261,9 @@ def select_supporters(model, encoder, rgbs, trajs, target_traj, valids):
     return mutual_loss
 
 
-def run_model(model, encoder, timestep, first_frame, rgbs, trajs, target_traj, curr_e_traj, valids, criterion, sw):
+def run_model(model, encoder, timestep,
+              first_frame, start_target_traj, target_motion,
+              rgbs, trajs, target_traj, curr_e_traj, valids, criterion, sw):
     # first_frame: B, C, H, W
 
     total_loss = torch.tensor(0.0, requires_grad=True, device=device)
@@ -272,7 +274,6 @@ def run_model(model, encoder, timestep, first_frame, rgbs, trajs, target_traj, c
     '''
     generate target: one trajectory that needs to be estimate
     '''
-    start_target_traj = target_traj[:, 0:1, :, :]  # B, 1, 1, 2
     relative_traj = trajs - curr_e_traj  # B, S, N0, 2
 
     # 3d position encoding
@@ -295,7 +296,11 @@ def run_model(model, encoder, timestep, first_frame, rgbs, trajs, target_traj, c
     '''
     Sample from CNN features
     '''
-    frame_features_map = encoder(first_frame.reshape(B, C, H, W)).reshape(B, 1, feature_map_dim,
+    first_frame_features_map = encoder(first_frame.reshape(B, C, H, W)).reshape(B, 1, feature_map_dim,
+                                                                       H // encoder_stride,
+                                                                       W // encoder_stride)  # 1, 8, 128, 46, 62
+
+    frame_features_map = encoder(rgbs[:, 0, :, :, :].reshape(B, C, H, W)).reshape(B, 1, feature_map_dim,
                                                                        H // encoder_stride,
                                                                        W // encoder_stride)  # 1, 8, 128, 46, 62
 
@@ -309,7 +314,7 @@ def run_model(model, encoder, timestep, first_frame, rgbs, trajs, target_traj, c
     target vector
     '''
 
-    target_traj_feature = utils.samp.bilinear_sample2d(frame_features_map[:, 0, :],
+    target_traj_feature = utils.samp.bilinear_sample2d(first_frame_features_map[:, 0, :],
                                                        start_target_traj[:, 0, 0, 0:1] / encoder_stride,
                                                        start_target_traj[:, 0, 0, 1:2] / encoder_stride)  # B, 128, 1
 
@@ -320,7 +325,7 @@ def run_model(model, encoder, timestep, first_frame, rgbs, trajs, target_traj, c
     relative motion
     '''
 
-    target_motion = (target_traj[:, 1:2, :, :] - start_target_traj)  # B, 1, 1, 2
+    # target_motion = (target_traj[:, 1:2, :, :] - start_target_traj)  # B, 1, 1, 2
     target_motion = torch.concat([target_motion, torch.ones(B, 1, 1, 1).cuda().float()], dim=-1)  # B, 1, 1, 3
     motion = pos[:, 1:, :, :] - pos[:, :-1, :, :]  # B, S-1, N-1, 3
 
@@ -619,84 +624,91 @@ def train():
         pred_traj = torch.zeros(B, S_out, 1, 2).cuda().float()
         total_loss = torch.tensor(0.0, requires_grad=True).to(device)
         model_loss = torch.tensor(0.0, requires_grad=True).to(device)
+        mutual_loss = torch.tensor(0.0, requires_grad=True).to(device)
 
-        for i in range(S_out // 4 - 1):
+        curr_e_traj = target_traj[:, 0:1, :, :].repeat(1, S_out, 1, 1)
 
-            frame_index = range(4*i, 4*i+8)
-            rgbs_sub = rgbs[:, frame_index, :, :, :]
-            target_traj_sub = target_traj[:, frame_index, :, :]
+        for _ in range(iters):
 
-            target_e, trajs_e, vis_e = run_pips(pips, rgbs_sub, target_traj_sub, N, sw_t)  # N-2
+            for i in range(S_out // 4 - 1):
 
-            mutual_loss = select_supporters(model, encoder, rgbs_sub, trajs_e, target_e, vis_e)
+                frame_index = range(4*i, 4*i+8)
+                rgbs_sub = rgbs[:, frame_index, :, :, :]
+                target_traj_sub = target_traj[:, frame_index, :, :]
+                curr_e_traj_sub = curr_e_traj[:, frame_index, :, :]
 
-            curr_e_traj = target_traj[:, 0:1, :, :].repeat(1, S, 1, 1)
+                # with torch.no_grad():
+                target_e, trajs_e, vis_e = run_pips(pips, rgbs_sub, target_traj_sub, N, sw_t)  # N-2
 
-            for _ in range(iters):
+                mutual_loss_sub = select_supporters(model, encoder, rgbs_sub, trajs_e, target_e, vis_e)
 
                 model_loss_sub, ate, pred_traj_sub = run_model(model, encoder, frame_index,
-                                                           rgbs[:, 0, :, :, :],
+                                                           rgbs[:, 0, :, :, :], target_traj[:, 0:1, :, :],
+                                                           target_traj[:, 1:2, :, :] - target_traj[:, 0:1, :, :],
                                                            rgbs_sub, trajs_e, target_traj_sub,
-                                                           curr_e_traj,
+                                                           curr_e_traj_sub,
                                                            vis_e, criterion, sw_t)
-                curr_e_traj = pred_traj_sub
+
                 model_loss = model_loss_sub + model_loss
+                mutual_loss = mutual_loss_sub + mutual_loss
 
-            pred_traj[:, frame_index, :, :] = pred_traj_sub
+                pred_traj[:, frame_index, :, :] = pred_traj_sub
 
-            total_loss = total_loss + model_loss + mutual_loss
+                if i == 0 and _ == 0:
 
-            if i == 0:
+                    sw_t.summ_scalar('unpooled/model_loss_' + str(i), model_loss)
+                    model_loss_pool_0_t.update([model_loss.detach().cpu().numpy()])
+                    sw_t.summ_scalar('pooled/model_loss_' + str(i), model_loss_pool_0_t.mean())
 
-                sw_t.summ_scalar('unpooled/model_loss_' + str(i), model_loss)
-                model_loss_pool_0_t.update([model_loss.detach().cpu().numpy()])
-                sw_t.summ_scalar('pooled/model_loss_' + str(i), model_loss_pool_0_t.mean())
+                    sw_t.summ_scalar('unpooled/mutual_loss_' + str(i), mutual_loss)
+                    mutual_loss_pool_0_t.update([mutual_loss.detach().cpu().numpy()])
+                    sw_t.summ_scalar('pooled/mutual_loss_' + str(i), mutual_loss_pool_0_t.mean())
 
-                sw_t.summ_scalar('unpooled/mutual_loss_' + str(i), mutual_loss)
-                mutual_loss_pool_0_t.update([mutual_loss.detach().cpu().numpy()])
-                sw_t.summ_scalar('pooled/mutual_loss_' + str(i), mutual_loss_pool_0_t.mean())
+                    sw_t.summ_scalar('unpooled/total_loss_' + str(i), total_loss)
+                    loss_pool_0_t.update([total_loss.detach().cpu().numpy()])
+                    sw_t.summ_scalar('pooled/total_loss_' + str(i), loss_pool_0_t.mean())
 
-                sw_t.summ_scalar('unpooled/total_loss_' + str(i), total_loss)
-                loss_pool_0_t.update([total_loss.detach().cpu().numpy()])
-                sw_t.summ_scalar('pooled/total_loss_' + str(i), loss_pool_0_t.mean())
+                    sw_t.summ_scalar('unpooled/average_error_' + str(i), ate)
+                    avg_error_pool_0_t.update([ate.detach().cpu().numpy()])
+                    sw_t.summ_scalar('pooled/average_error_' + str(i), avg_error_pool_0_t.mean())
 
-                sw_t.summ_scalar('unpooled/average_error_' + str(i), ate)
-                avg_error_pool_0_t.update([ate.detach().cpu().numpy()])
-                sw_t.summ_scalar('pooled/average_error_' + str(i), avg_error_pool_0_t.mean())
+                elif i == 1 and _ == 0:
+                    sw_t.summ_scalar('unpooled/model_loss_4', model_loss)
+                    model_loss_pool_4_t.update([model_loss.detach().cpu().numpy()])
+                    sw_t.summ_scalar('pooled/model_loss_4', model_loss_pool_4_t.mean())
 
-            elif i == 1:
-                sw_t.summ_scalar('unpooled/model_loss_4', model_loss)
-                model_loss_pool_4_t.update([model_loss.detach().cpu().numpy()])
-                sw_t.summ_scalar('pooled/model_loss_4', model_loss_pool_4_t.mean())
+                    sw_t.summ_scalar('unpooled/mutual_loss_4', mutual_loss)
+                    mutual_loss_pool_4_t.update([mutual_loss.detach().cpu().numpy()])
+                    sw_t.summ_scalar('pooled/mutual_loss_4', mutual_loss_pool_4_t.mean())
 
-                sw_t.summ_scalar('unpooled/mutual_loss_4', mutual_loss)
-                mutual_loss_pool_4_t.update([mutual_loss.detach().cpu().numpy()])
-                sw_t.summ_scalar('pooled/mutual_loss_4', mutual_loss_pool_4_t.mean())
+                    sw_t.summ_scalar('unpooled/total_loss_4', total_loss)
+                    loss_pool_4_t.update([total_loss.detach().cpu().numpy()])
+                    sw_t.summ_scalar('pooled/total_loss_4', loss_pool_4_t.mean())
 
-                sw_t.summ_scalar('unpooled/total_loss_4', total_loss)
-                loss_pool_4_t.update([total_loss.detach().cpu().numpy()])
-                sw_t.summ_scalar('pooled/total_loss_4' , loss_pool_4_t.mean())
+                    sw_t.summ_scalar('unpooled/average_error_4', ate)
+                    avg_error_pool_4_t.update([ate.detach().cpu().numpy()])
+                    sw_t.summ_scalar('pooled/average_error_4', avg_error_pool_4_t.mean())
 
-                sw_t.summ_scalar('unpooled/average_error_4' , ate)
-                avg_error_pool_4_t.update([ate.detach().cpu().numpy()])
-                sw_t.summ_scalar('pooled/average_error_4', avg_error_pool_4_t.mean())
+                elif i == 2 and _ == 0:
+                    sw_t.summ_scalar('unpooled/model_loss_8', model_loss)
+                    model_loss_pool_8_t.update([model_loss.detach().cpu().numpy()])
+                    sw_t.summ_scalar('pooled/model_loss_8', model_loss_pool_8_t.mean())
 
-            elif i == 2:
-                sw_t.summ_scalar('unpooled/model_loss_8', model_loss)
-                model_loss_pool_8_t.update([model_loss.detach().cpu().numpy()])
-                sw_t.summ_scalar('pooled/model_loss_8', model_loss_pool_8_t.mean())
+                    sw_t.summ_scalar('unpooled/mutual_loss_8', mutual_loss)
+                    mutual_loss_pool_8_t.update([mutual_loss.detach().cpu().numpy()])
+                    sw_t.summ_scalar('pooled/mutual_loss_8', mutual_loss_pool_8_t.mean())
 
-                sw_t.summ_scalar('unpooled/mutual_loss_8', mutual_loss)
-                mutual_loss_pool_8_t.update([mutual_loss.detach().cpu().numpy()])
-                sw_t.summ_scalar('pooled/mutual_loss_8', mutual_loss_pool_8_t.mean())
+                    sw_t.summ_scalar('unpooled/total_loss_8', total_loss)
+                    loss_pool_8_t.update([total_loss.detach().cpu().numpy()])
+                    sw_t.summ_scalar('pooled/total_loss_8', loss_pool_8_t.mean())
 
-                sw_t.summ_scalar('unpooled/total_loss_8', total_loss)
-                loss_pool_8_t.update([total_loss.detach().cpu().numpy()])
-                sw_t.summ_scalar('pooled/total_loss_8', loss_pool_8_t.mean())
+                    sw_t.summ_scalar('unpooled/average_error_8', ate)
+                    avg_error_pool_8_t.update([ate.detach().cpu().numpy()])
+                    sw_t.summ_scalar('pooled/average_error_8', avg_error_pool_8_t.mean())
 
-                sw_t.summ_scalar('unpooled/average_error_8', ate)
-                avg_error_pool_8_t.update([ate.detach().cpu().numpy()])
-                sw_t.summ_scalar('pooled/average_error_8', avg_error_pool_8_t.mean())
+            curr_e_traj = pred_traj
+
+        total_loss = model_loss + mutual_loss
 
         total_loss.backward()
         optimizer.step()
@@ -795,9 +807,9 @@ if __name__ == '__main__':
     parser.add_argument('--max_iters', type=int, help='iteration numbers',
                         default=20000)
     parser.add_argument('--use_cache', type=bool, help='whether to use cache in training;',
-                        default=False)
+                        default=True)
     parser.add_argument('--cache_len', type=int, help='cache len',
-                        default=100)
+                        default=10)
     args = parser.parse_args()
 
     cache = args.use_cache
